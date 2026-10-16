@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>zh_CN</string>
+	<key>CFBundleDisplayName</key>
+	<string>越狱备份</string>
+	<key>CFBundleExecutable</key>
+	<string>JBBackup</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.blr.jbbackup</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>JBBackup</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>MinimumOSVersion</key>
+	<string>14.0</string>
+	<key>UIDeviceFamily</key>
+	<array>
+		<integer>1</integer>
+	</array>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+	</array>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+	<!-- ⚠️ 没有 UILaunchScreen / UILaunchStoryboardName 时，iOS 会把 App 跑在
+	     「兼容模式」（缩放 + 黑边），界面上看就是四周一圈黑。给个空 dict 即为默认闪屏。 -->
+	<key>UILaunchScreen</key>
+	<dict/>
+	<!-- 允许在 Files 里直接看到自己的 Documents（同沙盒内有效；本 App 已经
+	     no-sandbox，主输出目录也放在 /var/mobile/Documents，不依赖这一项） -->
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+</dict>
+</plist>

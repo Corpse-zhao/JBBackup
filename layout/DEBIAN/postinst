@@ -1,0 +1,20 @@
+#!/bin/bash
+# JBBackup postinst —— 只做「注册 + 刷新图标」，绝不碰用户数据。
+
+# 让系统重新扫描应用列表（不同越狱环境 uicache 位置不同，逐个探测）
+for CAND in \
+	/var/containers/Bundle/Application/.jbroot-*/usr/bin/uicache \
+	/var/jb/usr/bin/uicache \
+	/usr/bin/uicache
+do
+	if [ -x "$CAND" ]; then
+		"$CAND" -a >/dev/null 2>&1 && break
+	fi
+done
+
+# 图标缓存刷新（可选，失败不影响）
+if [ -x /usr/bin/uicache ]; then
+	/usr/bin/uicache -a >/dev/null 2>&1 || true
+fi
+
+exit 0

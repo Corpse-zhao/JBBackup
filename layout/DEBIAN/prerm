@@ -1,0 +1,4 @@
+#!/bin/bash
+# JBBackup prerm —— 只收掉正在运行的自己，不删除任何用户备份。
+killall -9 JBBackup >/dev/null 2>&1 || true
+exit 0

@@ -1,0 +1,9 @@
+Package: com.blr.jbbackup
+Name: 越狱备份
+Version: 0.1.0
+Architecture: iphoneos-arm
+Description: 移除越狱前的"保命"工具。一键把已安装的插件包列表、apt 源、插件配置（含各 App 沙盒内的插件配置）打包，双份写入 /var/mobile/Documents 与 iCloud Drive；重新越狱后可一键还原配置并生成插件重装脚本。
+Maintainer: 板栗仁
+Author: 板栗仁
+Section: Utilities
+Depends: firmware (>= 14.0)

@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- ⭐ 关掉 App 沙盒：没有这一条，App 读不到 /var/mobile/Library/Preferences/，
+	     也读不到别的 App 的容器，更读不到 jbroot 里的 dpkg 数据库 —— 备份功能直接不成立。 -->
+	<key>com.apple.private.security.no-sandbox</key>
+	<true/>
+
+	<!-- ⭐ 保住"自己的数据容器"（配合 no-sandbox 使用，否则可能拿不到自己在
+	     /var/mobile/Containers/Data/Application/ 下的目录） -->
+	<key>com.apple.private.security.storage.AppDataContainers</key>
+	<true/>
+
+	<!-- 全盘读写（TrollStore 文档推荐的写法） -->
+	<key>com.apple.security.exception.files.absolute-path.read-write</key>
+	<array>
+		<string>/</string>
+	</array>
+
+	<!-- 系统级 App 标识：TrollStore 官方文档说明 no-sandbox 类 entitlement
+	     需要它才能"正常工作" -->
+	<key>platform-application</key>
+	<true/>
+
+	<!-- 允许以 root spawn 包内二进制（本版还没用到，为后续"一键 dpkg 重装"留口子；
+	     没有它也不影响任何现有功能） -->
+	<key>com.apple.private.persona-mgmt</key>
+	<true/>
+
+	<!-- ⛔ 以下三个在 iOS 15+ / A12+ 上被内核硬禁（PPL），签了会直接启动即崩，绝不能加：
+	     com.apple.private.cs.debugger
+	     dynamic-codesigning
+	     com.apple.private.skip-library-validation -->
+</dict>
+</plist>

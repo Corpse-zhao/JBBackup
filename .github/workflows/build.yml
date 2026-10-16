@@ -1,0 +1,285 @@
+name: Build JBBackup
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write        # 打 tag 时要创建 Release
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install toolchain
+        run: |
+          brew install make xz ldid
+
+      - name: Setup Theos (roothide 分支)
+        run: |
+          export THEOS=$HOME/theos
+          # ⚠️ 必须用 roothide/theos：官方 theos 没有 roothide package scheme，
+          #    会报 "'roothide' package scheme does not exist"，且产物 Architecture
+          #    会是 iphoneos-arm64，Sileo 在 roothide 设备上直接拒装。
+          git clone --recursive https://github.com/roothide/theos.git $THEOS
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/theos/sdks.git $THEOS/sdks-tmp
+          cd $THEOS/sdks-tmp
+          git sparse-checkout set iPhoneOS14.5.sdk
+          mv iPhoneOS14.5.sdk $THEOS/sdks/
+          rm -rf $THEOS/sdks-tmp
+          ls $THEOS/sdks/
+          echo "THEOS=$THEOS" >> $GITHUB_ENV
+          echo "$THEOS/bin" >> $GITHUB_PATH
+
+      # ⚠️ Preflight 必须排在 Build 之前：编译一挂就会被 skipped，看不到自检结论。
+      # ⭐ 这里直接调用本地那份 check_local.py —— CI 与本地**同一份**检查，
+      #    不会出现「本地绿、CI 红」这种白等一轮的情况。
+      - name: Preflight — 静态自检（与本地同一份脚本）
+        run: python3 check_local.py
+
+      # ⚠️ Windows 上 git 不记录可执行位 → DEBIAN 维护脚本克隆下来是 644
+      #    → 编译全过但倒在最后打包：
+      #      ERROR: maintainer script 'postinst' has bad permissions 644
+      #    ⭐ 这里 chmod 是兜底；正确做法是仓库里就存成 100755
+      #      （git update-index --chmod=+x layout/DEBIAN/postinst）
+      - name: Fix maintainer script permissions
+        run: |
+          if [ -d layout/DEBIAN ]; then
+            chmod 0755 layout/DEBIAN/* 2>/dev/null || true
+            ls -l layout/DEBIAN/
+          fi
+
+      - name: Build package (deb)
+        run: |
+          export THEOS=$HOME/theos
+          # ⚠️ 不要接 `| tail -60`：会吞掉 make 的退出码，scheme 报错也显示 success
+          gmake package THEOS_PACKAGE_SCHEME=roothide FINALPACKAGE=1
+          ls -la packages/
+
+      - name: Inspect package contents
+        run: |
+          python3 - <<'PY'
+          import glob, io, tarfile
+          for path in sorted(glob.glob("packages/*.deb")):
+              print("==>", path)
+              raw = open(path, "rb").read()
+              off, data_tar = 8, None
+              while off + 60 <= len(raw):
+                  hdr = raw[off:off+60]
+                  name = hdr[0:16].decode(errors="ignore").strip()
+                  if not name: break
+                  try: size = int(hdr[48:58].decode(errors="ignore").strip())
+                  except Exception: break
+                  off += 60
+                  body = raw[off:off+size]; off += size + (size % 2)
+                  if name.startswith("data.tar"): data_tar = body
+              if data_tar:
+                  try:
+                      with tarfile.open(fileobj=io.BytesIO(data_tar)) as tf:
+                          for n in sorted(tf.getnames()):
+                              if not n.endswith("/"): print("   ", n)
+                  except Exception as e:
+                      print("   [!] tar read failed:", e)
+          PY
+
+      - name: Diagnose Mach-O slices (deb)
+        run: |
+          python3 - <<'PY'
+          import glob, io, tarfile, struct
+          def slices(b):
+              out = []
+              if b[:4] == b"\xca\xfe\xba\xbe":
+                  n = struct.unpack(">I", b[4:8])[0]; off = 8
+                  for _ in range(n):
+                      ct, cs, o, sz, al = struct.unpack(">IIIII", b[off:off+20]); off += 20
+                      out.append(("cpu=0x%x" % ct, sz))
+              elif b[:4] == b"\xcf\xfa\xed\xfe":
+                  ct, cs = struct.unpack("<ii", b[4:12])
+                  out.append(("cpu=0x%x" % (ct & 0xffffffff), len(b)))
+              return out
+          for path in sorted(glob.glob("packages/*.deb")):
+              raw = open(path, "rb").read()
+              off, data_tar = 8, None
+              while off + 60 <= len(raw):
+                  hdr = raw[off:off+60]
+                  name = hdr[0:16].decode(errors="ignore").strip()
+                  if not name: break
+                  try: size = int(hdr[48:58].decode(errors="ignore").strip())
+                  except Exception: break
+                  off += 60
+                  body = raw[off:off+size]; off += size + (size % 2)
+                  if name.startswith("data.tar"): data_tar = body
+              if not data_tar: continue
+              try:
+                  with tarfile.open(fileobj=io.BytesIO(data_tar)) as tf:
+                      for m in tf.getmembers():
+                          if m.isfile() and m.name.endswith("JBBackup"):
+                              print(m.name, slices(tf.extractfile(m).read()))
+              except Exception as e:
+                  print("[!]", e)
+          PY
+        continue-on-error: true
+
+      # ================================================================
+      #  TrollStore 用 IPA
+      #  TrollStore 走 CoreTrust 漏洞（CVE-2023-41991），会**保留** IPA 里
+      #  用 ldid 签进去的任意 entitlements —— 这正是本 App 不越狱也能读全盘的前提。
+      #  普通侧载（AltStore / Sideloadly）会丢掉这些 entitlements，装上也读不到东西。
+      # ================================================================
+      - name: Build IPA for TrollStore
+        run: |
+          set -e
+          rm -rf ipa && mkdir -p ipa/stage
+          python3 - <<'PY'
+          import glob, io, os, shutil, stat, tarfile
+
+          def deb_data_tar(path):
+              raw = open(path, "rb").read()
+              off = 8
+              while off + 60 <= len(raw):
+                  hdr = raw[off:off+60]
+                  name = hdr[0:16].decode(errors="ignore").strip()
+                  if not name: break
+                  try: size = int(hdr[48:58].decode(errors="ignore").strip())
+                  except Exception: break
+                  off += 60
+                  body = raw[off:off+size]; off += size + (size % 2)
+                  if name.startswith("data.tar"): return body
+              return None
+
+          deb = sorted(glob.glob("packages/*.deb"))[0]
+          blob = deb_data_tar(deb)
+          assert blob, "no data.tar in %s" % deb
+          stage = "ipa/stage"
+          with tarfile.open(fileobj=io.BytesIO(blob)) as tf:
+              for m in tf.getmembers():
+                  # 手动解包：不用 extractall（其 filter 会改 mode），
+                  # 可执行位丢了的话 TrollStore 装上去点不动图标。
+                  target = os.path.join(stage, m.name.lstrip("./"))
+                  if m.isdir():
+                      os.makedirs(target, exist_ok=True)
+                      continue
+                  if not m.isfile():
+                      continue
+                  os.makedirs(os.path.dirname(target), exist_ok=True)
+                  with open(target, "wb") as fh:
+                      fh.write(tf.extractfile(m).read())
+                  mode = m.mode & 0o777
+                  if m.name.endswith("JBBackup"):
+                      mode = 0o755
+                  os.chmod(target, mode or 0o644)
+
+          # 找到 .app 目录（不管 deb 里前缀是 Applications/ 还是别的）
+          appdir = None
+          for root, dirs, files in os.walk(stage):
+              for d in dirs:
+                  if d.endswith(".app"):
+                      appdir = os.path.join(root, d)
+          assert appdir, "no .app found in deb payload"
+          print("app bundle:", appdir)
+
+          os.makedirs("ipa/Payload", exist_ok=True)
+          shutil.copytree(appdir, "ipa/Payload/" + os.path.basename(appdir), symlinks=True)
+          print("Payload ready:", os.listdir("ipa/Payload"))
+          PY
+
+          # 重新签一遍：确保 entitlements 一定在二进制里（TrollStore 靠它保留权限）
+          ldid -Sentitlements.plist ipa/Payload/JBBackup.app/JBBackup
+          ldid -e ipa/Payload/JBBackup.app/JBBackup > ipa/embedded-entitlements.plist
+          echo "=== 二进制里实际带上的 entitlements ==="
+          cat ipa/embedded-entitlements.plist
+
+          VER=$(grep -E '^Version:' control | awk '{print $2}')
+          ( cd ipa && zip -qry "../packages/JBBackup-${VER}.ipa" Payload )
+          ls -la packages/
+
+      - name: Verify IPA
+        run: |
+          set -e
+          IPA=$(ls packages/*.ipa | head -1)
+          echo "==> $IPA"
+          unzip -l "$IPA"
+          echo
+          echo "--- 断言 1：必须含 no-sandbox（否则 IPA 只是个被沙盒锁死的空壳）---"
+          grep -q 'com.apple.private.security.no-sandbox' ipa/embedded-entitlements.plist \
+            && echo "✅ no-sandbox 在" \
+            || { echo "❌ IPA 里没有 no-sandbox，装了也读不到系统文件"; exit 1; }
+          echo "--- 断言 2：不能含被 PPL 禁止的 entitlements（含则启动即崩）---"
+          for bad in com.apple.private.cs.debugger dynamic-codesigning skip-library-validation; do
+            if grep -q "$bad" ipa/embedded-entitlements.plist; then
+              echo "❌ 出现了被禁的 $bad —— A12+/iOS15+ 上签了会启动即崩"; exit 1
+            fi
+          done
+          echo "✅ 无被禁 entitlements"
+          echo "--- 断言 3：Payload/JBBackup.app/JBBackup 必须存在且有可执行位 ---"
+          ls -l ipa/Payload/JBBackup.app/ | head -20
+          test -x ipa/Payload/JBBackup.app/JBBackup || { echo "❌ 可执行位丢了"; exit 1; }
+          echo "✅ 可执行位正常"
+          echo "--- 断言 4：Mach-O 必须同时含 arm64 与 arm64e 两个切片 ---"
+          python3 - <<'PY'
+          import struct, sys
+          b = open("ipa/Payload/JBBackup.app/JBBackup", "rb").read()
+          cpus = []
+          if b[:4] == b"\xca\xfe\xba\xbe":
+              n = struct.unpack(">I", b[4:8])[0]; off = 8
+              for _ in range(n):
+                  ct = struct.unpack(">I", b[off:off+4])[0]; off += 20
+                  cpus.append(ct)
+          elif b[:4] == b"\xcf\xfa\xed\xfe":
+              cpus.append(struct.unpack("<I", b[4:8])[0])
+          names = {0x0100000c: "arm64", 0x0200000c: "arm64e"}
+          got = [names.get(c, hex(c)) for c in cpus]
+          print("   切片：", got)
+          # arm64e 是 roothide 设备（A12+）的原生切片；arm64 是兜底。
+          # 两个都有才能保证「越狱装 deb」和「不越狱装 IPA」都跑得起来。
+          if not any(c == 0x0100000c for c in cpus):
+              print("❌ 缺 arm64 切片"); sys.exit(1)
+          print("✅ 至少含 arm64 切片（arm64e 存在更佳）")
+          PY
+          echo
+          echo "--- Info.plist 关键字段 ---"
+          python3 - <<'PY'
+          import plistlib
+          d = plistlib.load(open("ipa/Payload/JBBackup.app/Info.plist", "rb"))
+          for k in ["CFBundleIdentifier", "CFBundleExecutable", "CFBundleDisplayName",
+                    "CFBundleShortVersionString", "MinimumOSVersion"]:
+              print("   %-28s = %s" % (k, d.get(k)))
+          PY
+
+      - name: Show control
+        run: |
+          for p in packages/*.deb; do echo "== $p"; dpkg-deb -f "$p" 2>/dev/null || true; done
+        continue-on-error: true
+
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: JBBackup-deb
+          path: packages/*.deb
+          if-no-files-found: error
+
+      - name: Upload .ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: JBBackup-ipa
+          path: packages/*.ipa
+          if-no-files-found: error
+
+      - name: Publish Release (仅在打 v* tag 时)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            packages/*.deb packages/*.ipa \
+            --title "JBBackup ${GITHUB_REF_NAME}" \
+            --notes "越狱插件与配置备份工具（deb 用 Sileo 装 / ipa 用 TrollStore 装）。详见附件说明。" \
+            || gh release upload "${GITHUB_REF_NAME}" packages/*.deb packages/*.ipa --clobber
