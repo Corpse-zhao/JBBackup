@@ -304,5 +304,5 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" \
             packages/*.deb packages/*.ipa \
             --title "JBBackup ${GITHUB_REF_NAME}" \
-            --notes "越狱插件与配置备份工具（deb 用 Sileo 装 / ipa 用 TrollStore 装）。详见附件说明。" \
+            --notes-file RELEASE_NOTES.md \
             || gh release upload "${GITHUB_REF_NAME}" packages/*.deb packages/*.ipa --clobber

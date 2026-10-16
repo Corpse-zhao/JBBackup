@@ -349,16 +349,25 @@ int main(void) {
 				NSString *o3 = [tmp stringByAppendingPathComponent:@"from-targz"];
 				err = nil;
 				NSUInteger n3 = [JBBZip extractTarGzAtPath:sysTgz toDirectory:o3 error:&err];
-				ok(n3 >= srcFiles, [NSString stringWithFormat:@"解开 tar.gz：计数 %lu（源树 %lu）%@",
-							(unsigned long)n3, (unsigned long)srcFiles,
-							err ? [@"（err: " stringByAppendingString:err] : @""]);
-				// ⚠️ 这里刻意**不**断言「计数 == 源树」：macOS 的 bsdtar 会额外写
-				//    pax / AppleDouble 之类的元数据条目，计数多几个不是我们的 bug。
-				//    真正的判据是下面这行 —— 解出来的树与源树逐字节一致。
+
+				// ⚠️ 刻意**不**断言「解包器自报计数 == 源树文件数」：
+				//    macOS 的 bsdtar 会额外写 pax 元数据条目（携带扩展属性），
+				//    解包器会把它们跳过 —— 实测自报 10、其中 7 个是跳过的 pax 头。
+				//    那既不是内容错位也不是 bug，拿它当断言只会让人误以为有问题。
+				//    真正有意义的不变量是下面两条：**落盘文件数**正确 + **逐字节一致**。
+				NSUInteger landed = countFiles([o3 stringByAppendingPathComponent:srcName]);
+				ok(landed == srcFiles, [NSString stringWithFormat:
+							@"tar.gz 落盘文件数 = %lu（源树 %lu）",
+							(unsigned long)landed, (unsigned long)srcFiles]);
+				if (n3 != landed) {
+					info([NSString stringWithFormat:
+						  @"解包器自报处理了 %lu 个常规条目，落盘 %lu 个 —— 差额是工具附加的元数据条目",
+						  (unsigned long)n3, (unsigned long)landed]);
+				}
 				reportTreeDiff(@"解 tar.gz 的结果 vs 源树",
 							   diffTrees(src, [o3 stringByAppendingPathComponent:srcName]));
-				if (n3 != srcFiles) {
-					info(@"计数与源树不同，列出解出条目供核对（确认多出来的是工具元数据而不是内容错位）：");
+				if (landed != srcFiles) {
+					info(@"落盘文件数不符，列出条目供核对：");
 					for (NSString *r in [fm enumeratorAtPath:o3]) info([@"· " stringByAppendingString:r]);
 				}
 			}
