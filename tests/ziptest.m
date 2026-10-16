@@ -157,7 +157,7 @@ static void reportTreeDiff(NSString *label, NSArray<NSString *> *bad) {
 		ok(YES, [NSString stringWithFormat:@"%@：完全一致", label]);
 		return;
 	}
-	ok(NO, [NSString stringWithFormat:@"%@：%lu 处差异", (unsigned long)bad.count, label]);
+	ok(NO, [NSString stringWithFormat:@"%@：%lu 处差异", label, (unsigned long)bad.count]);
 	for (NSString *d in bad) info([@"· " stringByAppendingString:d]);
 }
 
@@ -325,10 +325,15 @@ int main(void) {
 				NSString *o2 = [tmp stringByAppendingPathComponent:@"from-system"];
 				err = nil;
 				NSUInteger n2 = [JBBZip extractZipAtPath:sysZip toDirectory:o2 error:&err];
-				ok(n2 > 0, [NSString stringWithFormat:@"解开系统 zip：%lu 个文件%@",
-							(unsigned long)n2, err ? [@"（err: " stringByAppendingString:err] : @""]);
+				ok(n2 == srcFiles, [NSString stringWithFormat:@"解开系统 zip：%lu 个文件（源树 %lu）%@",
+							(unsigned long)n2, (unsigned long)srcFiles,
+							err ? [@"（err: " stringByAppendingString:err] : @""]);
 				reportTreeDiff(@"解系统 zip 的结果 vs 源树",
 							   diffTrees(src, [o2 stringByAppendingPathComponent:srcName]));
+				if (n2 != srcFiles) {
+					info(@"计数不符，列出解出条目供核对：");
+					for (NSString *r in [fm enumeratorAtPath:o2]) info([@"· " stringByAppendingString:r]);
+				}
 			}
 		} else {
 			ok(NO, @"找不到 /usr/bin/ditto");
@@ -344,10 +349,18 @@ int main(void) {
 				NSString *o3 = [tmp stringByAppendingPathComponent:@"from-targz"];
 				err = nil;
 				NSUInteger n3 = [JBBZip extractTarGzAtPath:sysTgz toDirectory:o3 error:&err];
-				ok(n3 > 0, [NSString stringWithFormat:@"解开 tar.gz：%lu 个文件%@",
-							(unsigned long)n3, err ? [@"（err: " stringByAppendingString:err] : @""]);
+				ok(n3 >= srcFiles, [NSString stringWithFormat:@"解开 tar.gz：计数 %lu（源树 %lu）%@",
+							(unsigned long)n3, (unsigned long)srcFiles,
+							err ? [@"（err: " stringByAppendingString:err] : @""]);
+				// ⚠️ 这里刻意**不**断言「计数 == 源树」：macOS 的 bsdtar 会额外写
+				//    pax / AppleDouble 之类的元数据条目，计数多几个不是我们的 bug。
+				//    真正的判据是下面这行 —— 解出来的树与源树逐字节一致。
 				reportTreeDiff(@"解 tar.gz 的结果 vs 源树",
 							   diffTrees(src, [o3 stringByAppendingPathComponent:srcName]));
+				if (n3 != srcFiles) {
+					info(@"计数与源树不同，列出解出条目供核对（确认多出来的是工具元数据而不是内容错位）：");
+					for (NSString *r in [fm enumeratorAtPath:o3]) info([@"· " stringByAppendingString:r]);
+				}
 			}
 		} else {
 			ok(NO, @"找不到 /usr/bin/tar");

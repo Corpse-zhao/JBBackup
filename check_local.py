@@ -806,6 +806,33 @@ if '"tests"' in pyp or "'tests'" in pyp:
 else:
     ok("push.py 不会漏推 tests/")
 
+head("D5：⭐ UTType 常量必须是我们核对过存在的（防「凭记忆猜 API 名」）")
+# 首轮 CI 就是挂在 UTTypeGNUZipArchive 上 —— 这个常量根本不存在，
+# 而它在本地完全看不出来：只有真拿 SDK 编一次才知道。
+# 所以任何 UTType 常量都必须先在这里显式登记一次。
+KNOWN_UTTYPES = {
+    "UTTypeItem", "UTTypeData", "UTTypeDirectory", "UTTypeFolder",
+    "UTTypeURL", "UTTypeFileURL", "UTTypeText", "UTTypePlainText",
+    "UTTypeJSON", "UTTypeXML", "UTTypePropertyList",
+    "UTTypeImage", "UTTypePNG", "UTTypeJPEG",
+    "UTTypeZIP", "UTTypeArchive", "UTTypeGZip",
+    "UTTypeExecutable", "UTTypeDiskImage", "UTTypeSpreadsheet",
+}
+used = set()
+for f in SRC_M + SRC_H:
+    for tok in re.findall(r"(?<![\w>])UTType[A-Z]\w*", strip_comments(read(f))):
+        used.add(tok)
+unknown = sorted(used - KNOWN_UTTYPES)
+if unknown:
+    for t in unknown:
+        fail("❌ 用到了未登记的 UTType 常量：%s —— 先确认它真的存在于 "
+             "UniformTypeIdentifiers.framework，再把它加进本脚本的 KNOWN_UTTYPES"
+             "（不存在的话 CI 会报 use of undeclared identifier）" % t)
+else:
+    ok("用到的 UTType 常量都已登记：%s" % (", ".join(sorted(used)) or "（无）"))
+if "UTTypeGNUZipArchive" in "\n".join(strip_comments(read(f)) for f in SRC_M):
+    fail("❌ UTTypeGNUZipArchive 又回来了 —— 这个常量不存在，必然是编译错误")
+
 # ===========================================================================
 print()
 if FAIL:

@@ -469,8 +469,6 @@ typedef NS_ENUM(NSInteger, JBBDiagRow) {
 
 #pragma mark - 还原
 
-#pragma mark - 还原
-
 /*!
  ⭐ 主入口：直接弹系统文件选择器，让用户从「文件」里挑备份。
  
@@ -486,17 +484,26 @@ typedef NS_ENUM(NSInteger, JBBDiagRow) {
 					  @"请先完成越狱，再回来点「还原配置」。"];
 		return;
 	}
+
+	// ⚠️ 别写 UTTypeGNUZipArchive —— 这个常量根本不存在，首轮 CI 就挂在它上面
+	//    （'use of undeclared identifier'）。改成按后缀向系统问类型：
+	//    拿不到就跳过，编译期不再依赖任何易变的常量名。
 	NSMutableArray<UTType *> *types = [NSMutableArray array];
 	if (UTTypeZIP) [types addObject:UTTypeZIP];
-	if (UTTypeGNUZipArchive) [types addObject:UTTypeGNUZipArchive];
-	[types addObject:UTTypeData];   // 兜底：老备份可能叫 .tgz 之类，不让用户「选不到」
+	for (NSString *ext in @[@"zip", @"gz", @"tgz", @"tar.gz", @"tar"]) {
+		UTType *t = [UTType typeWithFilenameExtension:ext];
+		if (t) [types addObject:t];
+	}
+	// 兜底：任何文件都能选。用户可能把备份改过名；就算选错也不怕，
+	// 解包会给出明确错误，而不是把界面卡住。
+	if (UTTypeData) [types addObject:UTTypeData];
 
 	UIDocumentPickerViewController *picker =
 		[[UIDocumentPickerViewController alloc] initForOpeningContentTypes:types asCopy:NO];
 	picker.delegate = self;
 	picker.allowsMultipleSelection = NO;
 	[self presentViewController:picker animated:YES completion:nil];
-	JBBLog(@"弹出文件选择器，等用户挑备份文件");
+	JBBLog(@"弹出文件选择器（%lu 种可接受类型），等用户挑备份文件", (unsigned long)types.count);
 }
 
 - (void)documentPicker:(UIDocumentPickerViewController *)controller

@@ -60,7 +60,9 @@ jobs:
       - name: Self-test — JBBZip 往返（打包 → 解包 → 逐字节比对）
         run: |
           set -e
-          clang -fobjc-arc -Wno-deprecated-declarations \
+          # -Werror=format：格式串参数写错（比如 %@ 和 %lu 顺序颠倒）
+          # 只在**失败分支**才会跑到，光看 warning 很容易漏过去 —— 直接升级成硬错误。
+          clang -fobjc-arc -Wno-deprecated-declarations -Werror=format \
             -I. -o /tmp/ziptest \
             tests/ziptest.m JBBZip.m JBBCommon.m \
             -framework Foundation -lz
