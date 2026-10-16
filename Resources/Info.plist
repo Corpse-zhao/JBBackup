@@ -58,5 +58,12 @@
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
+	<!-- 「打开所在文件夹」按钮靠 shareddocuments:// 跳到文件 App。
+	     ⚠️ canOpenURL: 必须在 LSApplicationQueriesSchemes 里声明过才不返回 NO
+	        （iOS 9 起强制），没声明的话这个按钮会永远走降级分支。 -->
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<string>shareddocuments</string>
+	</array>
 </dict>
 </plist>

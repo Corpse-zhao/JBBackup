@@ -4,6 +4,7 @@
 
 #import "JBBBackupEngine.h"
 #import "JBBCommon.h"
+#import "JBBZip.h"
 #import <sys/utsname.h>
 #import <time.h>
 
@@ -133,7 +134,9 @@ static BOOL JBBCopyDirSafe(NSString *src, NSString *dst, unsigned long long capB
 	NSMutableArray<NSString *> *names = [NSMutableArray array];
 	for (NSString *name in JBBListDir(JBBOutputRoot())) {
 		if (!name.length || [name hasPrefix:@"_"] || [name hasPrefix:@"."]) continue;
-		if ([name hasSuffix:@".tar.gz"]) continue;
+		// 归档产物不进「备份列表」（可解压的备份文件不能当目录用）
+		if ([name hasSuffix:@".zip"] || [name hasSuffix:@".tar.gz"] ||
+			[name hasSuffix:@".tgz"]) continue;
 		NSString *full = [JBBOutputRoot() stringByAppendingPathComponent:name];
 		BOOL isDir = NO;
 		if (![[NSFileManager defaultManager] fileExistsAtPath:full isDirectory:&isDir] || !isDir) continue;
@@ -160,31 +163,22 @@ static BOOL JBBCopyDirSafe(NSString *src, NSString *dst, unsigned long long capB
 	NSString *parent = [dir stringByDeletingLastPathComponent];
 	NSString *base = [dir lastPathComponent];
 	NSString *archive = [parent stringByAppendingPathComponent:
-						 [base stringByAppendingPathExtension:@"tar.gz"]];
+						 [base stringByAppendingPathExtension:@"zip"]];
 
 	[[NSFileManager defaultManager] removeItemAtPath:archive error:NULL];
 
-	NSString *jb = JBBJBRoot() ?: @"";
-	NSMutableArray<NSString *> *cands = [NSMutableArray array];
-	if (jb.length) {
-		[cands addObject:[jb stringByAppendingPathComponent:@"usr/bin/tar"]];
-		[cands addObject:[jb stringByAppendingPathComponent:@"bin/tar"]];
-	}
-	[cands addObject:@"/usr/bin/tar"];
-	[cands addObject:@"/bin/tar"];
-	NSString *tar = JBBFindTool(cands);
-	if (!tar.length) {
-		JBBLog(@"打包失败：找不到 tar（备份目录本身完整可用）");
+	// ⭐ 用自带的 ZIP 编码（JBBZip），不再 spawn 外部 tar 二进制。
+	//    老做法的三个问题：
+	//      ① 不同越狱环境 tar 的位置不一样，找不到就整个打包失败；
+	//      ② 「从文件里选备份还原」这条路上根本没有可用的 tar 去解包；
+	//      ③ 用户拿到 tar.gz 在「文件」App 里点开是打不开的，ZIP 才是通用格式。
+	NSString *err = nil;
+	unsigned long long n = [JBBZip createZipAtPath:archive fromDirectory:dir error:&err];
+	if (n == 0 || !JBBFileExists(archive)) {
+		JBBLog(@"打包失败：%@（备份目录本身完整可用）", err ?: @"未知原因");
 		return nil;
 	}
-
-	NSString *out = nil;
-	BOOL ok = JBBRunTool(tar, @[ @"-czf", archive, @"-C", parent, base ], &out);
-	if (!ok || !JBBFileExists(archive)) {
-		JBBLog(@"打包失败：tar -czf 返回失败。输出：%@", out ?: @"(无)");
-		return nil;
-	}
-	JBBLog(@"打包完成：%@（%@）", archive, JBBHumanSize(JBBPathSize(archive)));
+	JBBLog(@"打包完成：%@（%@）", archive, JBBHumanSize(n));
 	return archive;
 }
 
@@ -480,7 +474,7 @@ static BOOL JBBCopyDirSafe(NSString *src, NSString *dst, unsigned long long capB
 				 [dir stringByAppendingPathComponent:@"restore-configs.sh"]);
 
 	// ---------- 9. 打包 ----------
-	JBBReport(progress, @"打包 tar.gz…", 0.90);
+	JBBReport(progress, @"打包成 ZIP…", 0.90);
 	res.archivePath = [self archiveBackupDirNamed:stamp];
 
 	// ---------- 10. 双份写：iCloud Drive ----------

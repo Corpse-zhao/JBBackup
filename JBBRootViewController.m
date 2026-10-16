@@ -17,6 +17,7 @@
 #import "JBBCommon.h"
 #import "JBBBackupEngine.h"
 #import "JBBRestoreEngine.h"
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 /// 选项持久化文件
 static NSString *const kJBBConfigFile = @"_appconfig.plist";
@@ -45,7 +46,7 @@ typedef NS_ENUM(NSInteger, JBBDiagRow) {
 	JBBDiagCount,
 };
 
-@interface JBBRootViewController ()
+@interface JBBRootViewController () <UIDocumentPickerDelegate>
 
 @property (nonatomic, strong) JBBBackupOptions *options;
 @property (nonatomic, strong) NSArray<NSString *> *backupNames;
@@ -167,7 +168,7 @@ typedef NS_ENUM(NSInteger, JBBDiagRow) {
 		return @"默认配置已覆盖绝大多数插件。系统偏好（com.apple.*）与 Documents 大文件默认不备，避免体积失控。";
 	}
 	if (section == JBBSectionBackups) {
-		return @"⚠️ /var/mobile/Documents 会被「抹掉所有内容和设置」清掉。备份完请把 tar.gz 复制到 iCloud Drive / 电脑。";
+		return @"⚠️ /var/mobile/Documents 会被「抹掉所有内容和设置」清掉。备份完请用「导出」把 .zip 存到 iCloud Drive / 电脑。";
 	}
 	if (section == JBBSectionDiagnostics) {
 		return @"出问题时把日志复制出来发我即可，日志已封顶不会无限增长。";
@@ -263,7 +264,7 @@ typedef NS_ENUM(NSInteger, JBBDiagRow) {
 				case JBBActionRestoreConfigs:
 					cell.textLabel.text = @"❷ 还原配置";
 					cell.textLabel.textColor = [UIColor systemGreenColor];
-					cell.detailTextLabel.text = @"重新越狱后用：按 bundle id 找回各 App 沙盒里的配置";
+					cell.detailTextLabel.text = @"重新越狱后点这里 → 从「文件」里挑备份 zip，自动写回各 App 沙盒";
 					break;
 				case JBBActionRespring:
 					cell.textLabel.text = @"❸ 注销桌面";
@@ -360,7 +361,7 @@ typedef NS_ENUM(NSInteger, JBBDiagRow) {
 	if (indexPath.section == JBBSectionActions) {
 		switch (indexPath.row) {
 			case JBBActionBackupNow:        [self startBackup];              break;
-			case JBBActionRestoreConfigs:   [self pickBackupForRestore];     break;
+			case JBBActionRestoreConfigs:   [self pickArchiveForRestore];    break;
 			case JBBActionRespring:         [self confirmRespring];          break;
 			default: break;
 		}
@@ -446,13 +447,176 @@ typedef NS_ENUM(NSInteger, JBBDiagRow) {
 	if (r.warnings.length) {
 		[msg appendFormat:@"\n提示：\n%@\n", r.warnings];
 	}
-	[msg appendString:@"\n⚠️ 请把归档文件（tar.gz）复制到 iCloud Drive 或电脑 —— "
-					  @"抹机后 /var/mobile/Documents 会被清空。"];
-	[self alert:@"备份完成" msg:msg];
+	[msg appendString:@"\n现在就可以把右边的「导出」点掉，把 .zip 存到 iCloud Drive 或电脑。\n"
+					  @"⚠️ 抹机后 /var/mobile/Documents 会被清空，存在手机上那份不算数。"];
+
+	UIAlertController *a = [UIAlertController alertControllerWithTitle:@"备份完成"
+															   message:msg
+														preferredStyle:UIAlertControllerStyleAlert];
+	if (r.archivePath.length) {
+		__weak typeof(self) weakSelf = self;
+		NSString *zip = r.archivePath;
+		[a addAction:[UIAlertAction actionWithTitle:@"导出备份文件…"
+											  style:UIAlertActionStyleDefault
+											handler:^(UIAlertAction *x) { [weakSelf exportArchive:zip]; }]];
+		[a addAction:[UIAlertAction actionWithTitle:@"打开所在文件夹"
+											  style:UIAlertActionStyleDefault
+											handler:^(UIAlertAction *x) { [weakSelf openContainingFolder:zip]; }]];
+	}
+	[a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+	[self presentViewController:a animated:YES completion:nil];
 }
 
 #pragma mark - 还原
 
+#pragma mark - 还原
+
+/*!
+ ⭐ 主入口：直接弹系统文件选择器，让用户从「文件」里挑备份。
+ 
+ 为什么不能只靠 App 自己的备份列表：重新越狱之后 App 容器被抹了，
+ 列表里一条都没有 —— 而备份正躺在 iCloud Drive / 电脑 / 微信里。
+ 「点还原 → 让我选文件」才是重装后唯一说得通的路子。
+ */
+- (void)pickArchiveForRestore {
+	if (!JBBJBReady()) {
+		[self alert:@"现在还不能还原"
+				 msg:@"还原配置需要把文件写回 /var/mobile/Library/Preferences 与各 App 沙盒，\n"
+					  @"这些路径只有重新越狱之后才存在。\n\n"
+					  @"请先完成越狱，再回来点「还原配置」。"];
+		return;
+	}
+	NSMutableArray<UTType *> *types = [NSMutableArray array];
+	if (UTTypeZIP) [types addObject:UTTypeZIP];
+	if (UTTypeGNUZipArchive) [types addObject:UTTypeGNUZipArchive];
+	[types addObject:UTTypeData];   // 兜底：老备份可能叫 .tgz 之类，不让用户「选不到」
+
+	UIDocumentPickerViewController *picker =
+		[[UIDocumentPickerViewController alloc] initForOpeningContentTypes:types asCopy:NO];
+	picker.delegate = self;
+	picker.allowsMultipleSelection = NO;
+	[self presentViewController:picker animated:YES completion:nil];
+	JBBLog(@"弹出文件选择器，等用户挑备份文件");
+}
+
+- (void)documentPicker:(UIDocumentPickerViewController *)controller
+ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+	NSURL *url = urls.firstObject;
+	if (!url) return;
+	JBBLog(@"用户选择的备份文件：%@", url.path ?: url.absoluteString);
+	[self runRestoreFromPickedURL:url];
+}
+
+- (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller {
+	JBBLog(@"用户取消了文件选择");
+}
+
+- (void)runRestoreFromPickedURL:(NSURL *)url {
+	// 文件可能来自 iCloud Drive / 其他 App 的容器，会带安全作用域。
+	// 做法：在作用域开着的时候先拷进我们自己的目录，然后立刻还回去 ——
+	// 后面的解包/还原是异步的，一直占着别人的作用域不礼貌，也容易失效。
+	BOOL scoped = [url startAccessingSecurityScopedResource];
+	NSString *src = url.path;
+	NSString *base = src.lastPathComponent.length ? src.lastPathComponent : @"picked.zip";
+	NSString *stamp = JBBTimestampString();
+	NSString *tmp = [JBBOutputRoot() stringByAppendingPathComponent:
+					 [NSString stringWithFormat:@"_incoming-%@-%@", stamp, base]];
+	JBBEnsureDir(JBBOutputRoot());
+
+	NSFileManager *fm = [NSFileManager defaultManager];
+	[fm removeItemAtPath:tmp error:NULL];
+	NSError *err = nil;
+	BOOL copied = (src.length && JBBFileExists(src))
+		? [fm copyItemAtPath:src toPath:tmp error:&err] : NO;
+	if (scoped) [url stopAccessingSecurityScopedResource];
+
+	if (!copied) {
+		[self alert:@"读取这个文件失败"
+				 msg:[NSString stringWithFormat:
+			@"%@\n\n可能原因：iCloud 里那份还没下载完，或者这个文件已经被移走/改名。\n"
+			@"把它先用「文件」App 存到「我的 iPhone」上再试一次。",
+			err.localizedDescription ?: @"文件不存在或没有读取权限"]];
+		return;
+	}
+	JBBLog(@"已把选中的备份拷到临时位置：%@（%@）", tmp, JBBHumanSize(JBBPathSize(tmp)));
+
+	[self setBusy:YES];
+	__weak typeof(self) weakSelf = self;
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+		JBBRestoreResult *r = [JBBRestoreEngine restoreConfigsFromArchiveAtPath:tmp
+																	  progress:^(NSString *stage, double f) {
+			[weakSelf applyProgress:stage fraction:f];
+		}];
+		[[NSFileManager defaultManager] removeItemAtPath:tmp error:NULL];   // 临时副本用完就删
+		dispatch_async(dispatch_get_main_queue(), ^{
+			JBBRootViewController *self_ = weakSelf;
+			if (!self_) return;
+			[self_ setBusy:NO];
+			[self_ presentRestoreOutcome:r];
+		});
+	});
+}
+
+#pragma mark - 导出 / 跳转
+
+/// 系统导出面板：让用户自己选存到哪（iCloud Drive、我的 iPhone、隔空投送、微信…）。
+/// 这是 iOS 上唯一「一定管用」的导出方式，不依赖任何私有 URL scheme。
+- (void)exportArchive:(NSString *)archivePath {
+	if (!JBBFileExists(archivePath)) {
+		[self alert:@"文件不见了" msg:[NSString stringWithFormat:
+			@"%@\n\n可能已被删除。回备份列表点「重新打包 ZIP」可以再生成一个。", archivePath]];
+		return;
+	}
+	NSURL *url = [NSURL fileURLWithPath:archivePath];
+	UIDocumentPickerViewController *picker =
+		[[UIDocumentPickerViewController alloc] initForExportingURLs:@[url]];
+	picker.delegate = self;
+	[self presentViewController:picker animated:YES completion:nil];
+	JBBLog(@"弹出导出面板：%@", archivePath);
+}
+
+/// 尽量跳到「文件」App 里备份所在的位置。
+/// ⚠️ shareddocuments:// 不是公开 API，失败很正常 —— 所以失败时把路径复制给用户，
+///    并告诉他手工怎么走（iCloud Drive → JBBackup）。
+- (void)openContainingFolder:(NSString *)path {
+	BOOL isDir = NO;
+	NSString *dir = path;
+	if ([[NSFileManager defaultManager] fileExistsAtPath:path isDirectory:&isDir] && !isDir) {
+		dir = [path stringByDeletingLastPathComponent];
+	}
+	NSString *enc = [dir stringByAddingPercentEncodingWithAllowedCharacters:
+					 [NSCharacterSet URLPathAllowedCharacterSet]];
+	NSURL *url = enc.length ? [NSURL URLWithString:
+							   [NSString stringWithFormat:@"shareddocuments://%@", enc]] : nil;
+	UIApplication *app = [UIApplication sharedApplication];
+	if (url && [app canOpenURL:url]) {
+		[app openURL:url options:@{} completionHandler:nil];
+		JBBLog(@"跳转到文件 App：%@", dir);
+		return;
+	}
+	JBBCopyToPasteboard(dir);
+	[self alert:@"没能自动跳转（已复制路径）"
+			 msg:[NSString stringWithFormat:
+		@"%@\n\n手动走法：打开「文件」App → 浏览 → iCloud Drive → JBBackup，\n"
+		@"就能看到备份 zip，长按可以拷贝/分享出去。", dir]];
+}
+
+/// 还原结果统一弹窗（两个入口共用）
+- (void)presentRestoreOutcome:(JBBRestoreResult *)r {
+	UIAlertController *a = [UIAlertController alertControllerWithTitle:r.title
+															  message:r.detail
+													   preferredStyle:UIAlertControllerStyleAlert];
+	if (r.ok) {
+		__weak typeof(self) weakSelf = self;
+		[a addAction:[UIAlertAction actionWithTitle:@"立即注销桌面"
+											  style:UIAlertActionStyleDefault
+											handler:^(UIAlertAction *x) { [weakSelf confirmRespring]; }]];
+	}
+	[a addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]];
+	[self presentViewController:a animated:YES completion:nil];
+}
+
+/// 从「App 里已有的备份」还原（备份列表里点进去用；主入口是选文件那条路）
 - (void)pickBackupForRestore {
 	if (!self.backupNames.count) {
 		[self alert:@"没有可还原的备份" msg:@"先做一次备份吧。如果备份在 iCloud Drive 里，"
@@ -513,15 +677,7 @@ typedef NS_ENUM(NSInteger, JBBDiagRow) {
 			JBBRootViewController *self_ = weakSelf;
 			if (!self_) return;
 			[self_ setBusy:NO];
-			UIAlertController *a = [UIAlertController alertControllerWithTitle:r.title
-																	  message:r.detail
-															   preferredStyle:UIAlertControllerStyleAlert];
-			[a addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
-			if (r.ok) {
-				[a addAction:[UIAlertAction actionWithTitle:@"立即注销桌面" style:UIAlertActionStyleDefault
-												   handler:^(UIAlertAction *x) { [self_ confirmRespring]; }]];
-			}
-			[self_ presentViewController:a animated:YES completion:nil];
+			[self_ presentRestoreOutcome:r];
 		});
 	});
 }
@@ -546,7 +702,7 @@ typedef NS_ENUM(NSInteger, JBBDiagRow) {
 		JBBCopyToPasteboard([JBBBackupEngine pathForBackupName:name]);
 		[self toast:@"路径已复制"];
 	}]];
-	[sheet addAction:[UIAlertAction actionWithTitle:@"重新打包 tar.gz" style:UIAlertActionStyleDefault
+	[sheet addAction:[UIAlertAction actionWithTitle:@"重新打包 ZIP" style:UIAlertActionStyleDefault
 										   handler:^(UIAlertAction *a) { [self repack:name]; }]];
 	[sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
 	sheet.popoverPresentationController.sourceView = self.view;
@@ -565,7 +721,7 @@ typedef NS_ENUM(NSInteger, JBBDiagRow) {
 			if (!self_) return;
 			[self_ setBusy:NO];
 			if (a.length) [self_ alert:@"打包完成" msg:a];
-			else          [self_ alert:@"打包失败" msg:@"找不到 tar 或写入失败，详见日志。"];
+			else          [self_ alert:@"打包失败" msg:@"写入失败（磁盘满或没权限），详见诊断日志。"];
 		});
 	});
 }

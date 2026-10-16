@@ -35,4 +35,11 @@
 + (JBBRestoreResult *)restoreConfigsFromBackupName:(NSString *)name
 										  progress:(JBBProgressBlock)progress;
 
+/// ⭐ 主入口：从用户自己选的备份文件（.zip / .tar.gz）还原。
+/// 内部会先解到临时目录再走上面同一条还原逻辑，所以两条路的行为完全一致。
+/// 用途：重新越狱后 App 是空白的（没有任何「已有备份」记录），
+///       用户直接去「文件」里挑当初导出的那个 zip 就行。
++ (JBBRestoreResult *)restoreConfigsFromArchiveAtPath:(NSString *)archivePath
+											 progress:(JBBProgressBlock)progress;
+
 @end

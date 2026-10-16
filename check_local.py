@@ -13,6 +13,7 @@ JBBackup 本地预检 —— 把静态检查放到本地跑，省 CI 轮次。
   A 构建完整性  —— 源码文件缺失 / 漏进 Makefile / 版本号不一致 / entitlement 写错
   B 编译期硬伤  —— 括号不平衡 / 函数名打错 / 格式串 % 没转义 / ARC 桥接 / C 符号没 import
   C 数据安全    —— 还原前的越狱检查、安全快照、按 bundle id 定位容器、危险删除
+  D 测试基建    —— JBBZip 往返自测是否还在、是否真被 CI 跑、有没有被误编进 iOS 产物
 """
 import glob
 import io
@@ -270,11 +271,35 @@ else:
         ok("图标文件齐全（%s）" % ", ".join(
             "%s@2x/@3x" % b for b in bases))
 
+head("A9：用了 zlib 就必须在 Makefile 里链 -lz")
+# 症状很有欺骗性：代码全对，链接期报 "_inflate", referenced from: ... 一堆 undefined symbol，
+# 看起来像"函数没实现"，其实是没链库。
+uses_zlib = False
+for f in sorted(glob.glob("*.m")):
+    if re.search(r"#include\s*<zlib\.h>|#import\s*<zlib\.h>", read(f)):
+        uses_zlib = True
+if uses_zlib:
+    if re.search(r"^JBBackup_LDFLAGS\s*=.*-lz\b", mk, re.M):
+        ok("Makefile 里有 -lz")
+    else:
+        fail("❌ 有文件 include 了 zlib.h，但 Makefile 里没有 JBBackup_LDFLAGS = -lz")
+else:
+    print("   （没有用到 zlib，跳过）")
+
+head("A10：App 图标与资源目录（Theos 默认拷 Resources/）")
+# 之前踩过：以为要显式写 xxx_RESOURCE_DIRS，其实 bundle.mk 里没设时默认就用 Resources/
+if os.path.isdir("Resources"):
+    ok("Resources/ 存在（Theos 会整目录拷进 .app）")
+else:
+    fail("❌ 没有 Resources/ 目录")
+
 # ===========================================================================
 # B. 编译期硬伤
 # ===========================================================================
-SRC_M = sorted(glob.glob("*.m"))
-SRC_H = sorted(glob.glob("*.h"))
+# ⚠️ 连 tests/ 一起扫：那份往返自测同样要在 macOS 上被 clang 编一次，
+#    括号不平衡在那里就是一条编译错误，本地先拦住。
+SRC_M = sorted(glob.glob("*.m") + glob.glob("tests/*.m"))
+SRC_H = sorted(glob.glob("*.h") + glob.glob("tests/*.h"))
 
 head("B1：括号平衡（剥掉字符串与注释后再数）")
 bad = 0
@@ -374,19 +399,26 @@ C_SYMBOL_HEADERS = {
     "malloc": "stdlib.h", "free": "stdlib.h", "atoi": "stdlib.h",
     "printf": "stdio.h", "strlen": "string.h", "memcpy": "string.h",
     "memset": "string.h", "dispatch_after": "dispatch/dispatch.h",
+    # 自写 ZIP 编解码只依赖 zlib；少 include 一句会级联出一串看着莫名的报错
+    "crc32": "zlib.h", "deflate": "zlib.h", "inflate": "zlib.h",
+    "deflateInit2": "zlib.h", "inflateInit2": "zlib.h", "deflateEnd": "zlib.h",
+    "inflateEnd": "zlib.h", "gzopen": "zlib.h", "gzread": "zlib.h", "gzclose": "zlib.h",
 }
 bad = 0
 for path in SRC_M + SRC_H:
     raw = read(path)
     nc = strip_comments(raw)
-    imports = set(re.findall(r'#import\s*[<"]([^>"]+)[>"]', nc))
+    # ⚠️ 必须同时认 #import 与 #include —— C 头文件（如 zlib.h）习惯写 #include，
+    #    只匹配 #import 会把「明明 import 了」误报成「没 import」。
+    imports = set(re.findall(r'#(?:import|include)\s*[<"]([^>"\n]+)[>"]', nc))
     merged = nc
     for lh in re.findall(r'#import\s+"([^"]+)"', nc):
         for cand in [lh, os.path.join(os.path.dirname(path), lh)]:
             if os.path.exists(cand):
                 lraw = read(cand)
                 merged += "\n" + strip_comments(lraw)
-                imports |= set(re.findall(r'#import\s*[<"]([^>"]+)[>"]', strip_comments(lraw)))
+                imports |= set(re.findall(r'#(?:import|include)\s*[<"]([^>"\n]+)[>"]',
+                                          strip_comments(lraw)))
                 break
     miss = []
     for sym, hdr in C_SYMBOL_HEADERS.items():
@@ -503,9 +535,12 @@ re_src = strip_comments(read("JBBRestoreEngine.m"))
 be_src = strip_comments(read("JBBBackupEngine.m"))
 
 head("C1：⭐ 还原必须先确认「已越狱」，否则一律不许写盘")
-restore_body = find_method_body(re_src, "restoreConfigsFromBackupName:")
+# ⚠️ 必须盯**实现体** restoreFromDirectory:，不是公开包装。
+#    公开包装（restoreConfigsFromBackupName: / restoreConfigsFromArchiveAtPath:）只有十几行，
+#    里面当然没有安全快照逻辑 —— 盯错方法会得出「还原没有安全快照」的假警报。
+restore_body = find_method_body(re_src, "restoreFromDirectory:")
 if restore_body is None:
-    fail("❌ 找不到 restoreConfigsFromBackupName 函数体")
+    fail("❌ 找不到 restoreFromDirectory: 函数体（还原实现体）")
 else:
     i_ready = restore_body.find("JBBJBReady()")
     i_first_write = min([x for x in [
@@ -548,6 +583,20 @@ else:
             fail("❌ 安全快照目录创建失败后没有立即 return —— 会在没有退路的情况下继续覆盖")
         else:
             ok("安全快照目录创建失败即中止还原")
+
+head("C3b：⭐ 两个还原入口必须都汇到同一个实现体（禁止绕开安全快照路径）")
+# 以后加新入口（比如"从微信文件还原"）时最容易犯的错：另起一套写盘逻辑，
+# 那套没有 JBBRSafetyKeep → 用户就在没有退路的情况下被覆盖配置。
+for entry in ["restoreConfigsFromBackupName:", "restoreConfigsFromArchiveAtPath:"]:
+    b = find_method_body(re_src, entry)
+    if b is None:
+        fail("❌ 找不到入口 %s" % entry)
+    elif "restoreFromDirectory:" not in b:
+        fail("❌ 入口 %s 没有走 restoreFromDirectory: —— 它绕开了安全快照 / 越狱检查" % entry)
+    elif "JBBRCopy" in b or "JBBRSafetyKeep" in b:
+        fail("❌ 入口 %s 自己直接写盘了，应该只负责定位来源然后交给实现体" % entry)
+    else:
+        ok("%s 只是定位来源，写盘交给实现体" % entry)
 
 head("C4：⭐ 安全快照目录名必须以 _ 开头（否则会被当成一个「备份」列出来）")
 if "_restore-safety-" in re_src:
@@ -612,12 +661,150 @@ if re.search(r"NSLock|@synchronized|os_unfair_lock|dispatch_semaphore", cm):
 else:
     fail("❌ 日志缓冲没有加锁 —— 后台备份写、主线程读，会随机崩溃")
 
+head("C10：⭐ 归档解包必须防 Zip Slip（禁止条目名带 ../ 或绝对路径）")
+# 本 App 是 no-sandbox，而且「从文件里选备份还原」是个新的攻击面：
+# 一个精心构造的 zip 可以用 `../../Library/Preferences/x.plist` 把文件写到目标目录之外，
+# 等于拿到任意文件写。这条检查确保解包路径一定经过白名单式拼接。
+zip_src = read("JBBZip.m")
+if not zip_src:
+    fail("❌ 找不到 JBBZip.m")
+else:
+    if "JBBSafeJoin" not in zip_src:
+        fail("❌ JBBZip.m 里没有路径安全拼接函数")
+    else:
+        ok("有 JBBSafeJoin 做路径拼接")
+        body = find_body(zip_src, r"static NSString \*JBBSafeJoin\s*\([^)]*\)\s*\{")
+        if body is None:
+            fail("❌ 提取不到 JBBSafeJoin 函数体")
+        else:
+            checks = [
+                ('[seg isEqualToString:@".."]', "拒绝 .. 上跳"),
+                ("hasPrefix:@\"/\"", "拒绝绝对路径"),
+                ("hasPrefix:prefix", "落盘前二次确认在目标目录内"),
+            ]
+            for needle, label in checks:
+                if needle in body:
+                    ok(label)
+                else:
+                    fail("❌ JBBSafeJoin 缺少「%s」" % label)
+        # 反向断言：解包流程里必须真的用它（定义了却不用 = 白防）
+        if zip_src.count("JBBSafeJoin(") >= 3:
+            ok("解包流程里三处都用上了（zip 目录/zip 文件/tar）")
+        else:
+            fail("❌ JBBSafeJoin 定义在那儿但调用点太少，可能某条解包路径漏了防护")
+
+head("C11：⭐ 还原入口必须支持「从用户选的文件还原」")
+# 这是重新越狱后唯一可用的入口：App 容器被抹了，内部列表必然为空。
+restore_h = read("JBBRestoreEngine.h")
+if "restoreConfigsFromArchiveAtPath" in restore_h:
+    ok("还原引擎暴露了「从归档还原」")
+else:
+    fail("❌ 还原引擎没有 restoreConfigsFromArchiveAtPath —— 重装后无法从文件还原")
+ui_src = read("JBBRootViewController.m")
+if "UIDocumentPickerViewController" in ui_src and "initForOpeningContentTypes" in ui_src:
+    ok("界面用系统文件选择器挑备份")
+else:
+    fail("❌ 界面里没有用 UIDocumentPickerViewController 挑备份文件")
+if "initForExportingURLs" in ui_src:
+    ok("有系统导出面板（一键导出）")
+else:
+    fail("❌ 没有导出入口 —— 用户没法把备份存到 iCloud/电脑")
+if "shareddocuments" in read("Resources/Info.plist"):
+    ok("Info.plist 声明了 shareddocuments（否则 canOpenURL 恒为 NO，跳转按钮永远失效）")
+else:
+    fail("❌ Info.plist 没声明 LSApplicationQueriesSchemes/shareddocuments，"
+         "「打开所在文件夹」会永远走降级分支")
+
 head("C9：⭐ 输出目录必须与「不会写死盘符/用户名」的常量一致")
 for name in ["JBBOutputRoot", "JBBMobileDocumentsDir", "JBBIcloudRoot"]:
     if re.search(r"NSString\s*\*\s*" + name + r"\s*\(void\)", cm):
         ok("%s 有集中定义" % name)
     else:
         fail("❌ JBBCommon.m 里找不到 %s 的定义" % name)
+
+# ===========================================================================
+head("D1：⭐ zip 往返自测必须还在（JBBZip 是手写格式，测穿它比多编一次产物重要）")
+ziptest = read("tests/ziptest.m")
+if not ziptest:
+    fail("❌ tests/ziptest.m 不见了 —— 手写 ZIP 编解码就只剩静态检查兜着了")
+else:
+    ok("tests/ziptest.m 存在（%d 行）" % len(ziptest.splitlines()))
+    # 「必须踩到」的场景缺一个，这个测试就会给人一种虚假的安心感
+    scenes = [
+        ('/usr/bin/unzip', "拿系统 unzip 验 CRC/结构（交叉验证，不是自洽）"),
+        ('/usr/bin/ditto', "拿系统 ditto 交叉验证（读我们写的包）"),
+        ('"--keepParent"', "也读系统写的 zip（用户在「文件」里重新压缩的情形）"),
+        ('"-czf"', "拿系统 tar 造 tar.gz（v0.1.0 旧备份兼容）"),
+        ("65536", "踩到 inflate 分块边界（历史 CRC 跨块 bug 就死在这）"),
+        ("65537", "分块边界 +1"),
+        ("1536 * 1024", "多块大文件"),
+        ("0600", "权限位还原"),
+        ("empty.d", "空目录还原"),
+        ("escaped-relative", "Zip Slip 相对路径攻击"),
+        ("jbb-escaped-absolute", "Zip Slip 绝对路径攻击"),
+        ("diffTrees", "逐字节内容比对（不是只比文件数）"),
+    ]
+    for needle, label in scenes:
+        if needle in ziptest:
+            ok("覆盖：%s" % label)
+        else:
+            fail("❌ 自测里缺少「%s」（找不到 %s）" % (label, needle))
+    # 断言它真的会因为失败而退出非零，否则 CI 上永远绿
+    if "return gFail == 0 ? 0 : 1" in ziptest:
+        ok("失败时返回非零退出码（CI 能真的红）")
+    else:
+        fail("❌ 自测失败时没有返回非零退出码 —— CI 会一直显示通过")
+
+head("D2：⭐ 自测必须真的被 CI 跑起来")
+wf = read(".github/workflows/build.yml")
+if "tests/ziptest.m" in wf and "ziptest" in wf:
+    ok("workflow 里编译并运行了 tests/ziptest.m")
+else:
+    fail("❌ workflow 里没有运行 ziptest —— 写了测试但没人跑，等于没写")
+if re.search(r"^\s*/tmp/ziptest\s*$", wf, flags=re.M):
+    ok("真的执行了 /tmp/ziptest")
+else:
+    fail("❌ workflow 里只编译没执行 /tmp/ziptest")
+if "-lz" in wf:
+    ok("链接了 zlib（-lz）")
+else:
+    fail("❌ workflow 里编译自测没带 -lz")
+
+head("D3：⭐ UIKit 引用必须是条件式的（否则 macOS 上的自测编不过）")
+common_h = read("JBBCommon.h")
+if re.search(r"#if\s+__has_include\(<UIKit/UIKit\.h>\)\s*\n\s*#import\s+<UIKit/UIKit\.h>", common_h):
+    ok("JBBCommon.h 的 UIKit 用 __has_include 包住（两个平台同一份源码）")
+else:
+    fail("❌ JBBCommon.h 又变成无条件 #import <UIKit/UIKit.h> 了 —— "
+         "macOS 上没有 UIKit，CI 的往返自测会直接编不过")
+if "#ifdef JBB_HAS_UIKIT" in cm:
+    ok("JBBCommon.m 里唯一的 UIKit 调用点（剪贴板）也用同一个宏包住了")
+else:
+    fail("❌ JBBCommon.m 里的 UIPasteboard 没被 JBB_HAS_UIKIT 包住")
+# 反向断言：真正的 iOS 入口必须自己 import UIKit，不能靠 JBBCommon.h 传递
+for f in ["main.m", "JBBAppDelegate.h", "JBBRootViewController.h"]:
+    if "#import <UIKit/UIKit.h>" in read(f):
+        ok("%s 自己 import 了 UIKit（不依赖传递）" % f)
+    else:
+        fail("❌ %s 没有自己 import UIKit —— 一旦 JBBCommon.h 的条件判断在 iOS 上失手，它会编不过" % f)
+
+head("D4：⭐ 自测不许被链进 iOS 产物 / 不许被漏推")
+mk = read("Makefile")
+if "ziptest" in mk:
+    fail("❌ Makefile 里出现了 ziptest —— 它会带来第二个 main()，产物链接必崩")
+else:
+    ok("Makefile 没把 tests/ 链进 iOS 产物")
+# Theos 的 application.mk 只吃 JBBackup_FILES，但 Resources/ 是自动收集的；
+# tests/ 不在 Resources 下所以安全。这里把它钉死。
+if re.search(r"^\s*_RESOURCE_DIRS\s*[:+]?=", mk, flags=re.M):
+    fail("❌ Makefile 里手工设了 _RESOURCE_DIRS —— 容易把 tests/ 一起塞进 app bundle")
+else:
+    ok("没有手工覆盖 _RESOURCE_DIRS（tests/ 不会被当资源打包）")
+pyp = read("push.py")
+if '"tests"' in pyp or "'tests'" in pyp:
+    fail("❌ push.py 把 tests 目录排除了 —— CI 上会找不到 tests/ziptest.m")
+else:
+    ok("push.py 不会漏推 tests/")
 
 # ===========================================================================
 print()

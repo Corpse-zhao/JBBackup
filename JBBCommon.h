@@ -8,7 +8,16 @@
 //
 
 #import <Foundation/Foundation.h>
+
+// ⚠️ UIKit 只在 iOS 宿主存在。
+//    CI 里有一份 macOS 上跑的「打包 → 解包 → 内容比对」往返自测
+//    （tests/ziptest.m），它要复用 JBBCommon + JBBZip；用 __has_include
+//    兜住之后同一份源码两个平台都能编，不必维护一份假的 UIKit 头。
+//    唯一受影响的调用点是 JBBCopyToPasteboard（下面已用同一个宏包住）。
+#if __has_include(<UIKit/UIKit.h>)
 #import <UIKit/UIKit.h>
+#define JBB_HAS_UIKIT 1
+#endif
 
 #import <spawn.h>
 #import <sys/wait.h>

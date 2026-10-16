@@ -45,6 +45,27 @@ jobs:
       - name: Preflight — 静态自检（与本地同一份脚本）
         run: python3 check_local.py
 
+      # ================================================================
+      #  JBBZip 往返自测 —— 真的跑起来，不是静态检查
+      #
+      #  为什么必须排在 Build 之前：JBBZip 是本工程唯一一块手写的二进制格式
+      #  编解码（local header / central directory / EOCD / deflate 全是字节级
+      #  拼装），而它出错的代价是「用户抹掉越狱之后才发现备份根本打不开」。
+      #  这一条比多编一次产物重要，所以放前面，失败就早停。
+      #
+      #  为什么在 macOS 上能跑：JBBZip/JBBCommon 都不依赖 UIKit
+      #  （JBBCommon.h 里那个 UIKit 用 __has_include 包住了），
+      #  所以同一份源码在这里编成 CLI 测试程序。
+      # ================================================================
+      - name: Self-test — JBBZip 往返（打包 → 解包 → 逐字节比对）
+        run: |
+          set -e
+          clang -fobjc-arc -Wno-deprecated-declarations \
+            -I. -o /tmp/ziptest \
+            tests/ziptest.m JBBZip.m JBBCommon.m \
+            -framework Foundation -lz
+          /tmp/ziptest
+
       # ⚠️ Windows 上 git 不记录可执行位 → DEBIAN 维护脚本克隆下来是 644
       #    → 编译全过但倒在最后打包：
       #      ERROR: maintainer script 'postinst' has bad permissions 644

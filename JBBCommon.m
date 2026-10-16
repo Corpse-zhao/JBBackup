@@ -598,5 +598,11 @@ BOOL JBBRespring(void) {
 
 void JBBCopyToPasteboard(NSString *text) {
 	if (!text) return;
+#ifdef JBB_HAS_UIKIT
 	[UIPasteboard generalPasteboard].string = text;
+#else
+	// 非 iOS 宿主（CI 里的 ZIP 往返自测）：没有剪贴板，静默跳过。
+	// 不写日志 —— 这条路径只在测试环境出现，不需要污染日志。
+	(void)text;
+#endif
 }

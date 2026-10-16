@@ -8,16 +8,29 @@
 //   3. App 沙盒配置按 bundle id 重新定位容器 —— 重装 App 后容器 UUID 会变，
 //      照着备份里的旧 UUID 路径粘回去等于扔进垃圾桶。
 //   4. 只覆盖备份里「确实有的」文件，不删除任何其它东西。
-//   5. 本地没有备份目录时，自动去 iCloud Drive 找同名目录 / 同名 tar.gz 回捞。
+//   5. 本地没有备份目录时，自动去 iCloud Drive 找同名目录 / 同名归档回捞。
 //
 
 #import "JBBRestoreEngine.h"
 #import "JBBCommon.h"
+#import "JBBZip.h"
 
 #pragma mark - 结果
 
 @implementation JBBRestoreResult
 @end
+
+/// 「没越狱」的统一结论。备份/还原两个入口都要在动手之前用它挡一下。
+static JBBRestoreResult *JBBRNotJailbroken(void) {
+	JBBRestoreResult *r = [[JBBRestoreResult alloc] init];
+	r.ok = NO;
+	r.title = @"没有探测到越狱环境";
+	r.detail = @"还原配置必须把文件写回 /var/mobile/Library/Preferences 与各 App 沙盒，\n"
+			   @"这些路径只有在【重新越狱之后】才存在。\n\n"
+			   @"请先完成越狱（Sileo 能正常打开即可），再回到本页点「还原配置」。\n"
+			   @"如果你还没重装插件，先跑备份里的 restore-packages.sh。";
+	return r;
+}
 
 #pragma mark - 工具
 
@@ -81,6 +94,54 @@ static void JBBRSafetyKeep(NSString *existingPath, NSString *safetyDir, BOOL isD
 @implementation JBBRSource
 @end
 
+/// 把一个归档解到 <输出根>/_import-<时间戳>/ 下，返回里面那个「备份目录」。
+///
+/// 兼容两种打包习惯：
+///   ① 归档顶层就是备份目录（我们自己打的 zip 是这样）→ 返回 _import-x/<备份名>
+///   ② 用户手工把备份目录里的内容直接压成 zip（顶层是 manifest.plist / prefs/）→ 返回 _import-x
+static NSString *JBBRExtractArchive(NSString *archivePath, NSString **errOut) {
+	if (!JBBFileExists(archivePath)) {
+		if (errOut) *errOut = @"文件不存在";
+		return nil;
+	}
+	NSString *work = [JBBOutputRoot() stringByAppendingPathComponent:
+					  [NSString stringWithFormat:@"_import-%@", JBBTimestampString()]];
+	if (!JBBEnsureDir(work)) {
+		if (errOut) *errOut = @"建临时目录失败（磁盘满？）";
+		return nil;
+	}
+	NSString *err = nil;
+	NSUInteger n = [JBBZip extractArchiveAtPath:archivePath toDirectory:work error:&err];
+	if (n == 0) {
+		if (errOut) *errOut = err ?: @"归档是空的或已损坏";
+		return nil;
+	}
+	JBBLog(@"归档解出 %lu 个文件 → %@", (unsigned long)n, work);
+
+	// 情形 ②：内容直接摊在顶层
+	if (JBBFileExists([work stringByAppendingPathComponent:@"manifest.plist"]) ||
+		JBBFileExists([work stringByAppendingPathComponent:@"prefs"])) {
+		return work;
+	}
+	// 情形 ①：顶层是备份目录
+	NSString *fallback = nil;
+	for (NSString *e in JBBListDir(work)) {
+		if ([e hasPrefix:@"."] || [e hasPrefix:@"_"]) continue;
+		NSString *full = [work stringByAppendingPathComponent:e];
+		BOOL isDir = NO;
+		if (![[NSFileManager defaultManager] fileExistsAtPath:full isDirectory:&isDir] || !isDir) continue;
+		if (JBBFileExists([full stringByAppendingPathComponent:@"manifest.plist"]) ||
+			JBBFileExists([full stringByAppendingPathComponent:@"prefs"])) {
+			return full;
+		}
+		if (!fallback) fallback = full;
+	}
+	if (fallback.length) return fallback;
+
+	if (errOut) *errOut = @"解开了，但里面没有 manifest.plist / prefs，不像是 JBBackup 的备份";
+	return nil;
+}
+
 static JBBRSource *JBBRResolveSource(NSString *name) {
 	JBBRSource *s = [[JBBRSource alloc] init];
 	NSString *local = [JBBBackupEngine pathForBackupName:name];
@@ -102,45 +163,23 @@ static JBBRSource *JBBRResolveSource(NSString *name) {
 	}
 
 	NSString *archive = [icloud stringByAppendingPathComponent:
-						 [name stringByAppendingPathExtension:@"tar.gz"]];
+						 [name stringByAppendingPathExtension:@"zip"]];
 	if (!JBBFileExists(archive)) {
 		s.ok = NO;
 		s.note = [NSString stringWithFormat:@"本地与 iCloud 都找不到备份「%@」", name];
 		return s;
 	}
 
-	// 解包到本地一个临时工作目录
-	NSString *work = [JBBOutputRoot() stringByAppendingPathComponent:
-					  [NSString stringWithFormat:@"_icloud-%@", name]];
-	JBBEnsureDir(work);
-	NSString *jb = JBBJBRoot() ?: @"";
-	NSMutableArray<NSString *> *cands = [NSMutableArray array];
-	if (jb.length) {
-		[cands addObject:[jb stringByAppendingPathComponent:@"usr/bin/tar"]];
-		[cands addObject:[jb stringByAppendingPathComponent:@"bin/tar"]];
-	}
-	[cands addObject:@"/usr/bin/tar"];
-	[cands addObject:@"/bin/tar"];
-	NSString *tar = JBBFindTool(cands);
-	if (!tar.length) {
+	NSString *err = nil;
+	NSString *extracted = JBBRExtractArchive(archive, &err);
+	if (!extracted.length) {
 		s.ok = NO;
-		s.note = @"iCloud 里只有 tar.gz，但找不到 tar 不能解包";
+		s.note = [NSString stringWithFormat:@"iCloud 归档解包失败：%@", err ?: @"未知原因"];
 		return s;
 	}
-	NSString *out = nil;
-	// 归档内部顶层就是 <name>/ 这一层，所以解到 work 的父目录即可
-	NSString *parent = [work stringByDeletingLastPathComponent];
-	JBBRunTool(tar, @[ @"-xzf", archive, @"-C", parent ], &out);
-	NSString *extracted = [parent stringByAppendingPathComponent:name];
-	if (JBBFileExists(extracted)) {
-		s.dir = extracted;
-		s.note = [NSString stringWithFormat:@"从 iCloud 的 %@ 解包得到", [archive lastPathComponent]];
-		s.ok = YES;
-		return s;
-	}
-	s.ok = NO;
-	s.note = [NSString stringWithFormat:@"iCloud 归档解包失败：%@",
-			  (out.length ? out : @"tar 无输出")];
+	s.dir = extracted;
+	s.note = [NSString stringWithFormat:@"从 iCloud 的 %@ 解包得到", [archive lastPathComponent]];
+	s.ok = YES;
 	return s;
 }
 
@@ -202,7 +241,7 @@ static JBBRSource *JBBRResolveSource(NSString *name) {
 	if (JBBListDir([dir stringByAppendingPathComponent:@"appcache"]).count) [has addObject:@"缓存 deb"];
 	if (has.count) [s appendFormat:@"内容：%@\n", [has componentsJoinedByString:@"、"]];
 
-	NSString *archive = [dir stringByAppendingPathExtension:@"tar.gz"];
+	NSString *archive = [dir stringByAppendingPathExtension:@"zip"];
 	if (JBBFileExists(archive)) {
 		[s appendFormat:@"归档：%@\n", JBBHumanSize(JBBPathSize(archive))];
 	}
@@ -241,8 +280,11 @@ static JBBRSource *JBBRResolveSource(NSString *name) {
 	return [NSString stringWithFormat:@"su -c 'sh \"%@\"'", path];
 }
 
-+ (JBBRestoreResult *)restoreConfigsFromBackupName:(NSString *)name
-										  progress:(JBBProgressBlock)progress {
+/// 真正的还原主体。两种入口（从列表里的备份 / 从「文件」里选的 ZIP）都汇到这里。
++ (JBBRestoreResult *)restoreFromDirectory:(NSString *)dir
+									  note:(NSString *)note
+							   displayName:(NSString *)name
+								  progress:(JBBProgressBlock)progress {
 	JBBRestoreResult *res = [[JBBRestoreResult alloc] init];
 	NSMutableArray<NSString *> *warns = [NSMutableArray array];
 	NSMutableArray<NSString *> *lines = [NSMutableArray array];
@@ -250,30 +292,22 @@ static JBBRSource *JBBRResolveSource(NSString *name) {
 	// ---------- 0. 前置检查 ----------
 	JBBRReport(progress, @"检查越狱环境…", 0.03);
 	if (!JBBJBReady()) {
-		res.ok = NO;
-		res.title = @"没有探测到越狱环境";
-		res.detail = @"还原配置必须把文件写回 /var/mobile/Library/Preferences 与各 App 沙盒，\n"
-					 @"这些路径只有在【重新越狱之后】才存在。\n\n"
-					 @"请先完成越狱（Sileo 能正常打开即可），再回到本页点「还原配置」。\n"
-					 @"如果你还没重装插件，先跑备份里的 restore-packages.sh。";
-		JBBLog(@"还原中止：%@", res.title);
+		JBBLog(@"还原中止：%@", @"没有探测到越狱环境");
 		JBBRReport(progress, @"中止", 1.0);
-		return res;
+		return JBBRNotJailbroken();
 	}
 	JBBLog(@"===== 开始还原配置：%@ =====", name);
 
 	JBBRReport(progress, @"定位备份…", 0.07);
-	JBBRSource *src = JBBRResolveSource(name);
-	if (!src.ok) {
+	if (!dir.length || !JBBFileExists(dir)) {
 		res.ok = NO;
-		res.title = @"找不到这个备份";
-		res.detail = src.note;
-		JBBLog(@"还原中止：%@", src.note);
+		res.title = @"找不到备份内容";
+		res.detail = [NSString stringWithFormat:@"路径不存在：%@", dir ?: @"(空)"];
+		JBBLog(@"还原中止：%@", res.detail);
 		JBBRReport(progress, @"中止", 1.0);
 		return res;
 	}
-	NSString *dir = src.dir;
-	[lines addObject:[NSString stringWithFormat:@"备份来源：%@（%@）", src.note, dir]];
+	[lines addObject:[NSString stringWithFormat:@"备份来源：%@（%@）", note ?: @"", dir]];
 
 	NSString *prefsGlobalSrc   = [dir stringByAppendingPathComponent:@"prefs/global"];
 	NSString *prefsContSrc     = [dir stringByAppendingPathComponent:@"prefs/containers"];
@@ -437,7 +471,7 @@ static JBBRSource *JBBRResolveSource(NSString *name) {
 		@"tool": JBB_VERSION,
 		@"restoredAt": JBBTimestampString(),
 		@"fromBackup": name,
-		@"sourceNote": src.note ?: @"",
+		@"sourceNote": note ?: @"",
 		@"sourceDir": dir,
 		@"globalRestored": @(res.globalRestored),
 		@"containerRestored": @(res.containerRestored),
@@ -479,6 +513,50 @@ static JBBRSource *JBBRResolveSource(NSString *name) {
 
 	JBBRReport(progress, @"完成", 1.0);
 	return res;
+}
+
+#pragma mark - 公开入口
+
++ (JBBRestoreResult *)restoreConfigsFromBackupName:(NSString *)name
+										  progress:(JBBProgressBlock)progress {
+	if (!JBBJBReady()) return JBBRNotJailbroken();
+	JBBRSource *src = JBBRResolveSource(name);
+	if (!src.ok) {
+		JBBRestoreResult *r = [[JBBRestoreResult alloc] init];
+		r.ok = NO;
+		r.title = @"找不到这个备份";
+		r.detail = src.note;
+		JBBLog(@"还原中止：%@", src.note);
+		return r;
+	}
+	return [self restoreFromDirectory:src.dir note:src.note displayName:name progress:progress];
+}
+
++ (JBBRestoreResult *)restoreConfigsFromArchiveAtPath:(NSString *)archivePath
+											 progress:(JBBProgressBlock)progress {
+	if (!JBBJBReady()) return JBBRNotJailbroken();
+
+	JBBRReport(progress, @"解开备份文件…", 0.03);
+	NSString *err = nil;
+	NSString *dir = JBBRExtractArchive(archivePath, &err);
+	if (!dir.length) {
+		JBBRestoreResult *r = [[JBBRestoreResult alloc] init];
+		r.ok = NO;
+		r.title = @"这个文件打不开";
+		r.detail = [NSString stringWithFormat:
+			@"%@\n\n支持 .zip 与 .tar.gz（越狱备份 v0.1.0 打的是 zip）。\n"
+			@"如果你选的是别的类型，请先用「文件」App 把它压缩成 zip 再试。",
+			err ?: @"未知原因"];
+		JBBLog(@"从归档还原中止：%@", r.detail);
+		JBBRReport(progress, @"中止", 1.0);
+		return r;
+	}
+	NSString *name = [archivePath.lastPathComponent stringByDeletingPathExtension];
+	if (!name.length) name = [dir lastPathComponent];
+	return [self restoreFromDirectory:dir
+								 note:[NSString stringWithFormat:@"你选择的文件：%@", archivePath.lastPathComponent]
+						  displayName:name
+							 progress:progress];
 }
 
 @end
