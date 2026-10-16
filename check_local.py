@@ -251,6 +251,25 @@ try:
 except Exception as e:
     print("   （git 不可用，跳过：%s）" % e)
 
+head("A8：Info.plist 声明的图标文件必须真的存在（否则桌面是空白图标）")
+# 声明了 CFBundleIconFiles 但文件不在 Resources/ 里 → 图标显示成一片白，没有任何报错。
+ip = read("Resources/Info.plist")
+m_icons = re.search(r"<key>CFBundleIconFiles</key>\s*<array>(.*?)</array>", ip, re.S)
+if not m_icons:
+    print("   （未声明图标，跳过）")
+else:
+    bases = re.findall(r"<string>([^<]+)</string>", m_icons.group(1))
+    missing = []
+    for base in bases:
+        scale = [base + s for s in ("@2x", "@3x")] + [base]
+        if not any(os.path.exists(os.path.join("Resources", n + ".png")) for n in scale):
+            missing.append(base)
+    if missing:
+        fail("❌ Info.plist 声明了图标 %s，但 Resources/ 里找不到对应的 .png" % missing)
+    else:
+        ok("图标文件齐全（%s）" % ", ".join(
+            "%s@2x/@3x" % b for b in bases))
+
 # ===========================================================================
 # B. 编译期硬伤
 # ===========================================================================
