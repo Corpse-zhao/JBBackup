@@ -379,6 +379,103 @@ for path in SRC_M + SRC_H:
         bad = 1
 if not bad:
     ok("C 库符号的 import 检查通过")
+    ok("（本次检查覆盖 B1~B5；下面是首轮 CI 新学到、本地补上的两类）")
+
+head("B6：⭐ 自定义 property 访问器必须操作 ivar（防「setter 里调自己」无限递归）")
+# 血泪（本工程首轮 CI）：
+#     - (void)setBusy:(BOOL)busy { self.busy = busy; ... }
+# 自定义 setter 里调用自己 = 无限递归爆栈。编译期只报一条
+#   ivar '_busy' which backs the property is not referenced in this property's accessor
+# 看起来像「有个没用的变量」，实际是运行时必崩；-Werror 下还会直接编译失败。
+#
+# ⚠️ 为什么本地预检第一版没拦住：B1 只数括号，`self.busy = busy` 括号完全平衡。
+#    「平衡」不等于「语义正确」—— 这次补的是语义断言。
+bad = 0
+for path in SRC_M:
+    src = strip_comments(read(path))
+    props = set(re.findall(r"@property\s*\([^)]*\)\s*[\w\s\*<>]*?\b(\w+)\s*;", src))
+    for name in sorted(props):
+        cap = name[0].upper() + name[1:]
+        # --- 自定义 setter：- (void)setXxx:(T)xxx { ... } ---
+        # 用 ")setXxx:" 当锚点：这样只会命中「方法定义」，不会命中 [self setXxx:...] 这种调用点
+        sb = find_method_body(src, ")set" + cap + ":")
+        if sb is not None:
+            if re.search(r"self\s*\.\s*" + re.escape(name) + r"\s*=", sb):
+                fail("❌ %s 的 setter set%s: 里出现 `self.%s = ...` —— 自己调自己，无限递归爆栈"
+                     % (path, cap, name))
+                bad = 1
+            elif ("_" + name) not in sb:
+                fail("❌ %s 的 setter set%s: 里没有读写 ivar _%s"
+                     % (path, cap, name))
+                fail("   十有八九是写成了 self.%s = %s;（自递归）；否则 -Wunused-property-ivar 会报错"
+                     % (name, name))
+                bad = 1
+        # --- 自定义 getter：- (T)xxx { ... } ---
+        gm = re.search(r"-\s*\(\s*[\w\s\*<>]*?\b" + re.escape(name) + r"\s*\)\s*"
+                       + re.escape(name) + r"\s*\{", src)
+        if gm:
+            gb = _brace_body_at(src, gm.end() - 1)
+            if gb is not None and ("_" + name) not in gb:
+                fail("❌ %s 的自定义 getter %s 里没有读 ivar _%s" % (path, name, name))
+                bad = 1
+if not bad:
+    ok("自定义访问器都有对应对的 ivar（无自递归）")
+
+head("B7：⭐ 空消息发送 `[[x y]]`（方括号手滑）")
+# 血泪（本工程首轮 CI 的另一个错）：
+#     (unsigned long)[[JBBManualPackageNames() count]]
+#   ├─ 正确的应该是 [JBBManualPackageNames() count]
+#   └─ 写成 [[...]] 后，最外层那对方括号里**只剩一个方括号组、没有选择器**
+#      → clang 报 "expected identifier"，但报在行尾的 `]]` 上，很难一眼看出是哪错。
+# ⚠️ B1 的括号计数对这个完全无效：`[[ ... ]]` 是平衡的。
+# 判据：某对方括号的内容里，**第一个** `[` 的匹配 `]` 恰好落在内容的最后一个字符上
+#       → 整段内容就是「单独一个方括号组」，外层没有任何选择器 → 空消息。
+# ⚠️ 不能用 inner.startswith("[") and inner.endswith("]") 这种粗糙判据 ——
+#    `[[a b] c:[d e]]` 也满足它，但那是完全合法的嵌套消息（血泪：本检查第一版就误报了）。
+def find_empty_messages(path):
+    text = strip_comments(read(path))
+    text = re.sub(r'"(?:\\.|[^"\\])*"', '""', text)   # 先去字符串，避免中文里出现方括号
+    stack, hits = [], []
+    for idx, ch in enumerate(text):
+        if ch == "[":
+            if idx and text[idx - 1] == "@":
+                continue                                  # @[ ... ] 数组字面量，不是消息发送
+            stack.append(idx)
+        elif ch == "]":
+            if not stack:
+                continue
+            start = stack.pop()
+            inner = text[start + 1:idx]
+            stripped = inner.strip()
+            if not stripped.startswith("["):
+                continue                                  # 外层第一个 token 不是方括号组 → 正常
+            # 找 inner 里第一个 "[" 的匹配 "]"，看它是不是刚好在结尾
+            depth, match_end = 0, -1
+            for k, c in enumerate(inner):
+                if c == "[":
+                    depth += 1
+                elif c == "]":
+                    depth -= 1
+                    if depth == 0:
+                        match_end = k
+                        break
+            if match_end >= 0 and inner[match_end:].strip() == "]":
+                line = text.count("\n", 0, start) + 1
+                hits.append((line, stripped))
+    return hits
+
+
+bad = []
+for f in SRC_M:
+    for line, inner in find_empty_messages(f):
+        bad.append((f, line))
+if bad:
+    for f, line in bad:
+        fail("❌ %s 第 %d 行出现空消息发送（多的那个方括号要删掉）：" % (f, line))
+        fail("     看这一行的结构：形如 `(unsigned long)[[Foo() count]]`，"
+             "正确写法是 `(unsigned long)[Foo() count]`")
+else:
+    ok("无空消息发送（%d 个源文件）" % len(SRC_M))
 
 # ===========================================================================
 # C. 数据安全（本项目最不能出错的部分）

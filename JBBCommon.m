@@ -199,9 +199,9 @@ NSString *JBBEnvSummary(void) {
 	[s appendFormat:@"jbroot：%@\n", root];
 	[s appendFormat:@"dpkg 库：%@\n", [root stringByAppendingPathComponent:@"var/lib/dpkg/status"]];
 	[s appendFormat:@"已安装包：%lu 个\n", (unsigned long)[JBBInstalledPackages() count]];
-	[s appendFormat:@"手动安装：%lu 个\n", (unsigned long)[[JBBManualPackageNames() count]];
-	[s appendFormat:@"apt 源文件：%lu 个\n", (unsigned long)[[JBBSourceFilePaths() count]];
-	[s appendFormat:@"App 容器：%lu 个\n", (unsigned long)[[JBBAppContainerPaths() count]];
+	[s appendFormat:@"手动安装：%lu 个\n", (unsigned long)[JBBManualPackageNames() count]];
+	[s appendFormat:@"apt 源文件：%lu 个\n", (unsigned long)[JBBSourceFilePaths() count]];
+	[s appendFormat:@"App 容器：%lu 个\n", (unsigned long)[JBBAppContainerPaths() count]];
 	[s appendFormat:@"输出目录：%@（%@）\n", JBBOutputRoot(),
 		JBBPathWritable(JBBOutputRoot()) ? @"可写" : @"不可写"];
 	[s appendFormat:@"iCloud：%@（%@）\n", JBBIcloudRoot(),

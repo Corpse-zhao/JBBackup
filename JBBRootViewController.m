@@ -119,7 +119,9 @@ typedef NS_ENUM(NSInteger, JBBDiagRow) {
 #pragma mark - 忙碌态
 
 - (void)setBusy:(BOOL)busy {
-	self.busy = busy;
+	// ⚠️ 必须写 ivar，绝不能写 self.busy = busy —— 那是在自定义 setter 里调自己，
+	//    无限递归直接爆栈；clang 的 -Wunused-property-ivar 会顺带报出来。
+	_busy = busy;
 	self.navigationItem.rightBarButtonItem.enabled = !busy;
 	self.progressHeader.hidden = !busy;
 	if (busy) {
