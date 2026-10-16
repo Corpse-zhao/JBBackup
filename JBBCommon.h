@@ -33,7 +33,7 @@
 #import <dispatch/dispatch.h>
 
 /// 版本号 —— 全工程唯一来源。任何要展示/写日志的版本号都必须从这里取。
-#define JBB_VERSION @"0.2.0"
+#define JBB_VERSION @"0.2.1"
 
 #pragma mark - 日志
 

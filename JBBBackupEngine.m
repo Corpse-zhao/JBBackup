@@ -182,6 +182,119 @@ static BOOL JBBCopyDirSafe(NSString *src, NSString *dst, unsigned long long capB
 	return archive;
 }
 
+#pragma mark - 删除备份
+
+/// 归档后缀白名单（只有这些扩展名才允许被当成「备份的归档」删掉）
+static NSArray<NSString *> *JBBArchiveExts(void) {
+	return @[@"zip", @"tar.gz", @"tgz"];
+}
+
+/// ⚠️ 防呆：只接受「一个直接位于备份根目录下的目录名」。
+///    不加这个校验的话，`../../var/mobile/Library` 或者 `_appconfig.plist`
+///    这样的名字一旦进来就会把备份根目录之外的东西端掉。
+static BOOL JBBIsSafeBackupName(NSString *name) {
+	if (!name.length) return NO;
+	if ([name containsString:@"/"] || [name containsString:@"\\"]) return NO;
+	if ([name rangeOfString:@":"].location != NSNotFound) return NO;
+	if ([name hasPrefix:@"."] || [name hasPrefix:@"_"]) return NO;   // _appconfig.plist / _restore-safety-*
+	if ([name isEqualToString:@".."] || [name isEqualToString:@"."]) return NO;
+	return YES;
+}
+
++ (NSArray<NSString *> *)locationsForBackupNamed:(NSString *)name {
+	if (!JBBIsSafeBackupName(name)) return @[];
+	NSMutableArray<NSString *> *out = [NSMutableArray array];
+	// 两个根：本地 与 iCloud Drive
+	NSArray<NSString *> *roots = @[JBBOutputRoot() ?: @"", JBBIcloudRoot() ?: @""];
+	for (NSString *root in roots) {
+		if (!root.length) continue;
+
+		// 目录形态（备份的原始形态）
+		NSString *dir = [root stringByAppendingPathComponent:name];
+		if (JBBFileExists(dir)) [out addObject:dir];
+
+		// 归档形态。⚠️ 两个根都要找：备份时如果 iCloud 复制失败会退化成
+		// 「只写目录」，所以 iCloud 那边可能只有目录、也可能只有归档。
+		for (NSString *ext in JBBArchiveExts()) {
+			NSString *a = [root stringByAppendingPathComponent:
+						   [name stringByAppendingPathExtension:ext]];
+			if (JBBFileExists(a)) [out addObject:a];
+		}
+	}
+	return out;
+}
+
++ (unsigned long long)totalSizeForBackupNamed:(NSString *)name {
+	unsigned long long total = 0;
+	for (NSString *p in [self locationsForBackupNamed:name]) total += JBBPathSize(p);
+	return total;
+}
+
++ (unsigned long long)deleteBackupNamed:(NSString *)name error:(NSString **)errOut {
+	if (errOut) *errOut = nil;
+
+	if (!JBBIsSafeBackupName(name)) {
+		if (errOut) *errOut = [NSString stringWithFormat:
+							   @"拒绝删除：备份名不合法（%@）", name.length ? name : @"空"];
+		JBBLog(@"⚠️ 拒绝删除，备份名不合法：%@", name ?: @"(nil)");
+		return 0;
+	}
+
+	NSArray<NSString *> *locs = [self locationsForBackupNamed:name];
+	if (!locs.count) {
+		if (errOut) *errOut = [NSString stringWithFormat:
+							   @"找不到备份「%@」（本地与 iCloud 都没有）", name];
+		return 0;
+	}
+
+	// ⚠️ 双保险：目录必须「看起来像备份」才删。归档文件的后缀已由
+	//    locationsForBackupNamed 限死（zip/tar.gz/tgz），不再额外判。
+	NSMutableArray<NSString *> *victims = [NSMutableArray array];
+	NSFileManager *fm = [NSFileManager defaultManager];
+	for (NSString *p in locs) {
+		BOOL isDir = NO;
+		[fm fileExistsAtPath:p isDirectory:&isDir];
+		if (!isDir) { [victims addObject:p]; continue; }
+		BOOL looksLikeBackup =
+			JBBFileExists([p stringByAppendingPathComponent:@"manifest.plist"]) ||
+			JBBFileExists([p stringByAppendingPathComponent:@"packages"]);
+		if (looksLikeBackup) {
+			[victims addObject:p];
+		} else {
+			JBBLog(@"跳过「不像备份」的目录，不删：%@", p);
+		}
+	}
+	if (!victims.count) {
+		if (errOut) *errOut = @"找到的条目都不像是备份，已放弃删除";
+		return 0;
+	}
+
+	// ⚠️ 体积必须在删之前算 —— 删完再算就是 0 了
+	unsigned long long total = 0;
+	for (NSString *p in victims) total += JBBPathSize(p);
+
+	NSMutableArray<NSString *> *failed = [NSMutableArray array];
+	for (NSString *p in victims) {
+		NSError *e = nil;
+		if ([fm removeItemAtPath:p error:&e]) {
+			JBBLog(@"已删除：%@", p);
+		} else {
+			[failed addObject:[NSString stringWithFormat:@"%@（%@）",
+							   p, e.localizedDescription ?: @"未知原因"]];
+		}
+	}
+
+	if (failed.count) {
+		if (errOut) *errOut = [NSString stringWithFormat:@"有 %lu 处没删掉：\n%@",
+							   (unsigned long)failed.count,
+							   [failed componentsJoinedByString:@"\n"]];
+	}
+	JBBLog(@"===== 删除备份「%@」：%lu 处 / 释放 %@%@ =====",
+		   name, (unsigned long)(victims.count - failed.count), JBBHumanSize(total),
+		   failed.count ? [NSString stringWithFormat:@"（%lu 处失败）", (unsigned long)failed.count] : @"");
+	return total;
+}
+
 + (JBBBackupResult *)backupWithOptions:(JBBBackupOptions *)options
 							  progress:(JBBProgressBlock)progress {
 	JBBBackupResult *res = [[JBBBackupResult alloc] init];

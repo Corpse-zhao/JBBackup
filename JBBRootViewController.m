@@ -168,7 +168,8 @@ typedef NS_ENUM(NSInteger, JBBDiagRow) {
 		return @"默认配置已覆盖绝大多数插件。系统偏好（com.apple.*）与 Documents 大文件默认不备，避免体积失控。";
 	}
 	if (section == JBBSectionBackups) {
-		return @"⚠️ /var/mobile/Documents 会被「抹掉所有内容和设置」清掉。备份完请用「导出」把 .zip 存到 iCloud Drive / 电脑。";
+		return @"⚠️ /var/mobile/Documents 会被「抹掉所有内容和设置」清掉。备份完请用「导出」把 .zip 存到 iCloud Drive / 电脑。\n"
+				@"左滑或右滑某一行都能删除那个备份（本地与 iCloud 两份一起删）。";
 	}
 	if (section == JBBSectionDiagnostics) {
 		return @"出问题时把日志复制出来发我即可，日志已封顶不会无限增长。";
@@ -383,6 +384,121 @@ typedef NS_ENUM(NSInteger, JBBDiagRow) {
 			default: break;
 		}
 	}
+}
+
+#pragma mark - 删除备份（左右滑都支持）
+
+/// 这一行是不是「一个真实的、可以删的备份」
+/// （占位行「还没有备份」、列表为空、正在忙 —— 都不给删）
+- (BOOL)canDeleteRowAtIndexPath:(NSIndexPath *)indexPath {
+	if (self.busy) return NO;
+	if (indexPath.section != JBBSectionBackups) return NO;
+	if (!self.backupNames.count) return NO;
+	return indexPath.row < (NSInteger)self.backupNames.count;
+}
+
+/// 构造那个红色的「删除」动作（左右两个方向共用，避免两处逻辑走偏）
+- (UIContextualAction *)deleteActionForBackupNamed:(NSString *)name {
+	__weak typeof(self) weakSelf = self;
+	UIContextualAction *del = [UIContextualAction
+		contextualActionWithStyle:UIContextualActionStyleDestructive
+							title:@"删除"
+						  handler:^(UIContextualAction *action, __kindof UIView *sourceView,
+									void (^completionHandler)(BOOL)) {
+		// 先收起滑动，再把确认弹窗排到下一个 runloop —— 在滑动动画没结束时
+		// present alert 会被 UIKit 吞掉（这是踩过的坑，表现为「点了没反应」）。
+		completionHandler(YES);
+		dispatch_async(dispatch_get_main_queue(), ^{
+			[weakSelf confirmDeleteBackup:name];
+		});
+	}];
+	del.image = [UIImage systemImageNamed:@"trash"];
+	del.backgroundColor = [UIColor systemRedColor];
+	return del;
+}
+
+// ⚠️ 用户说的是「右滑删除」，而 iOS 的删除惯例是「左滑」。
+//    两种叫法都有人用，与其猜错不如两边都挂上 —— 反正都是同一个动作、
+//    同一个确认弹窗，成本为零，但不会出现「按我说的方向滑不出来」。
+- (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView
+	trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
+	if (![self canDeleteRowAtIndexPath:indexPath]) return nil;
+	UIContextualAction *del = [self deleteActionForBackupNamed:self.backupNames[indexPath.row]];
+	UISwipeActionsConfiguration *cfg = [UISwipeActionsConfiguration configurationWithActions:@[del]];
+	// ⚠️ 必须 NO：否则滑到一半就会自动执行删除，跳过确认弹窗 ——
+	//    对一个「删掉就没了」的备份来说太危险。
+	cfg.performsFirstActionWithFullSwipe = NO;
+	return cfg;
+}
+
+- (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView
+	leadingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
+	if (![self canDeleteRowAtIndexPath:indexPath]) return nil;
+	UIContextualAction *del = [self deleteActionForBackupNamed:self.backupNames[indexPath.row]];
+	UISwipeActionsConfiguration *cfg = [UISwipeActionsConfiguration configurationWithActions:@[del]];
+	cfg.performsFirstActionWithFullSwipe = NO;
+	return cfg;
+}
+
+/*!
+ ⭐ 删除前必须确认，而且要把「会删掉哪些路径、一共多大」摊开给用户看。
+ 理由：备份是这个 App 存在的全部意义，误删等于把用户的退路掐了。
+ 另外要把「已导出的 zip 不受影响」说清楚，否则用户会以为导出那份也没了。
+ */
+- (void)confirmDeleteBackup:(NSString *)name {
+	unsigned long long size = [JBBBackupEngine totalSizeForBackupNamed:name];
+	NSArray<NSString *> *locs = [JBBBackupEngine locationsForBackupNamed:name];
+
+	NSMutableString *msg = [NSMutableString string];
+	[msg appendFormat:@"备份：%@\n占用：%@\n\n", name, JBBHumanSize(size)];
+	if (locs.count) {
+		[msg appendString:@"将删除以下位置（本地与 iCloud 一起删 —— 只删本地的话，\n"
+						@"还原时会被 iCloud 那份又捞回来）：\n"];
+		for (NSString *p in locs) [msg appendFormat:@"· %@\n", p];
+		[msg appendString:@"\n"];
+	}
+	[msg appendString:@"⚠️ 删除后无法恢复。\n已经「导出」到 iCloud Drive / 电脑的 .zip 不受影响。"];
+
+	UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"删除这个备份？"
+															   message:msg
+														preferredStyle:UIAlertControllerStyleAlert];
+	[ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
+		JBBLog(@"用户取消删除备份：%@", name);
+	}]];
+	__weak typeof(self) weakSelf = self;
+	[ac addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive
+									   handler:^(UIAlertAction *a) {
+		[weakSelf runDeleteBackup:name];
+	}]];
+	[self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)runDeleteBackup:(NSString *)name {
+	JBBLog(@"===== 用户确认删除备份：%@ =====", name);
+	[self setBusy:YES];
+	// ⚠️ 删除走后台：iCloud 目录可能很大，在主页面上删会卡住界面。
+	//    而且列表刷新必须按**名字**重取（reloadBackups），不能靠 indexPath ——
+	//    删完一项之后所有行的下标都变了，按老下标操作会删错人。
+	__weak typeof(self) weakSelf = self;
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+		NSString *err = nil;
+		unsigned long long freed = [JBBBackupEngine deleteBackupNamed:name error:&err];
+		dispatch_async(dispatch_get_main_queue(), ^{
+			JBBRootViewController *self_ = weakSelf;
+			if (!self_) return;
+			[self_ setBusy:NO];
+			[self_ reloadBackups];
+			if (err.length && freed == 0) {
+				[self_ alert:@"没删掉" msg:err];
+			} else if (err.length) {
+				[self_ alert:@"只删掉一部分"
+						 msg:[NSString stringWithFormat:@"已释放 %@，但还有残留：\n\n%@",
+							  JBBHumanSize(freed), err]];
+			} else {
+				[self_ toast:[NSString stringWithFormat:@"已删除，释放 %@", JBBHumanSize(freed)]];
+			}
+		});
+	});
 }
 
 #pragma mark - 备份

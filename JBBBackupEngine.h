@@ -60,4 +60,24 @@ typedef void (^JBBProgressBlock)(NSString *stage, double fraction);
 /// 把某个备份目录打包成 tar.gz，返回归档路径（失败返回 nil）
 + (NSString *)archiveBackupDirNamed:(NSString *)name;
 
+#pragma mark - 删除备份
+
+/// 这个备份在磁盘上实际占用的所有位置（本地/iCloud × 目录/归档），不存在的自动跳过。
+/// 界面上做「删除确认」时要把它列出来给用户看 —— 免得用户以为只删了本地那份。
++ (NSArray<NSString *> *)locationsForBackupNamed:(NSString *)name;
+/// 上面那些位置加起来的字节数（用于确认弹窗显示「将释放多少」）
++ (unsigned long long)totalSizeForBackupNamed:(NSString *)name;
+
+/// ⭐ 删除一个备份：本地与 iCloud 的「目录 + 归档」一起删。
+///
+/// ⚠️ 为什么必须一起删：还原时 JBBRResolveSource() 在本地找不到目录会去 iCloud 捞
+///    （目录，或以归档解包的形式）。只删本地的话，用户会看到「删掉的备份自己又回来了」。
+///
+/// ⚠️ 名字先过校验（不许带 / \ 、不许 _ 或 . 开头）—— 否则一个畸形名字就能把
+///    整个备份根目录或 _appconfig.plist 一起端掉。另外只删「确认是备份」的条目
+///    （目录里得有 manifest.plist 或 packages/）。
+///
+/// @return 释放的字节数；errOut 非空表示有东西没删掉（可能部分成功）
++ (unsigned long long)deleteBackupNamed:(NSString *)name error:(NSString **)errOut;
+
 @end

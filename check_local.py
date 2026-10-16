@@ -833,6 +833,136 @@ else:
 if "UTTypeGNUZipArchive" in "\n".join(strip_comments(read(f)) for f in SRC_M):
     fail("❌ UTTypeGNUZipArchive 又回来了 —— 这个常量不存在，必然是编译错误")
 
+head("E1：⭐ 删除备份必须连 iCloud 那份一起删（否则「删掉的备份会自己回来」）")
+eng_m = read("JBBBackupEngine.m")
+loc_body = find_method_body(eng_m, "+ (NSArray<NSString *> *)locationsForBackupNamed:")
+del_body = find_method_body(eng_m, "+ (unsigned long long)deleteBackupNamed:")
+# ⚠️ 函数体一律先剥注释再检查：注释里写「一定要记得 X」不该算「做到了 X」，
+#    注释里出现某个词（比如解释「不要用 indexPath」）也不该算违规。
+loc_body = strip_comments(loc_body) if loc_body else loc_body
+del_body = strip_comments(del_body) if del_body else del_body
+if loc_body is None:
+    fail("❌ 找不到 locationsForBackupNamed: 的实现体")
+else:
+    for needle, label in [("JBBOutputRoot()", "本地根"), ("JBBIcloudRoot()", "iCloud 根")]:
+        if needle in loc_body:
+            ok("删除位置里含%s" % label)
+        else:
+            fail("❌ locationsForBackupNamed: 没有覆盖%s —— "
+                 "只删本地的话，还原时 JBBRResolveSource 会从 iCloud 把同一个备份捞回来，"
+                 "用户会看到「删掉的备份又出现了」" % label)
+    if "stringByAppendingPathExtension" in loc_body:
+        ok("同时覆盖归档形态（.zip / .tar.gz）")
+    else:
+        fail("❌ 只找目录、没找归档 —— 备份时打包出来的那个 .zip 会留下来")
+if del_body is None:
+    fail("❌ 找不到 deleteBackupNamed: 的实现体")
+else:
+    if "locationsForBackupNamed:" in del_body:
+        ok("deleteBackupNamed: 复用 locationsForBackupNamed:（两个根不会漏一个）")
+    else:
+        fail("❌ deleteBackupNamed: 没走 locationsForBackupNamed: —— 容易只删掉本地那份")
+
+head("E2：⭐ 删除前必须校验名字（防呆：一个畸形名字就能端掉整个备份根目录）")
+if re.search(r"static BOOL JBBIsSafeBackupName\s*\(", eng_m):
+    ok("有 JBBIsSafeBackupName 名字校验")
+    guard = find_body(eng_m, r"static BOOL JBBIsSafeBackupName\s*\([^)]*\)\s*\{")
+    if guard is None:
+        fail("❌ 提取不到 JBBIsSafeBackupName 函数体")
+    else:
+        for needle, label in [(r'containsString:@"/"', "拒绝路径分隔符"),
+                              (r'containsString:@"\\\\"', "拒绝反斜杠"),
+                              (r'hasPrefix:@"_"', "拒绝 _ 开头（_appconfig.plist / _restore-safety-*）"),
+                              (r'hasPrefix:@"\."', "拒绝 . 开头")]:
+            if re.search(needle, guard):
+                ok(label)
+            else:
+                fail("❌ JBBIsSafeBackupName 缺少「%s」" % label)
+else:
+    fail("❌ 没有 JBBIsSafeBackupName —— 删除是唯一一个「用户输入直接决定删什么」的地方，"
+         "必须先把名字限死在一个安全的字符集里")
+if del_body is not None:
+    ig, ir = del_body.find("JBBIsSafeBackupName"), del_body.find("removeItemAtPath")
+    if ig >= 0 and ir >= 0 and ig < ir:
+        ok("校验发生在任何删除动作之前")
+    elif ir < 0:
+        ok("（实现体里没直接调 removeItemAtPath，跳过先后判断）")
+    else:
+        fail("❌ deleteBackupNamed: 里 JBBIsSafeBackupName 没排在 removeItemAtPath 之前")
+    if "manifest.plist" in del_body and "packages" in del_body:
+        ok("只删「看起来像备份」的目录（manifest.plist / packages 至少有一个）")
+    else:
+        fail("❌ 没做「像不像备份」的判断 —— 同名无关目录会被一起删掉")
+    # 体积必须在删之前算：删完再算就是 0
+    isz, ir2 = del_body.find("JBBPathSize("), del_body.find("removeItemAtPath")
+    if isz >= 0 and ir2 >= 0 and isz < ir2:
+        ok("释放体积在删除之前统计（删完再算就是 0）")
+    else:
+        fail("❌ JBBPathSize 没排在 removeItemAtPath 之前 —— 弹窗会显示「释放 0 字节」")
+
+head("E3：⭐ 右滑删除必须是「确认后才真删」（全滑不得绕过弹窗）")
+ui_src2 = read("JBBRootViewController.m")
+for sel, label in [("trailingSwipeActionsConfigurationForRowAtIndexPath", "右滑（trailing）"),
+                   ("leadingSwipeActionsConfigurationForRowAtIndexPath", "左滑（leading）")]:
+    if sel in ui_src2:
+        ok("挂了%s动作" % label)
+    else:
+        fail("❌ 没有 %s —— 用户说的「右滑」和 iOS 惯例的「左滑」得都支持，不然会有一边滑不出来" % label)
+if "UIContextualActionStyleDestructive" in ui_src2:
+    ok("用破坏性样式（红色）")
+else:
+    fail("❌ 删除动作不是 destructive 样式")
+n_full = ui_src2.count("performsFirstActionWithFullSwipe")
+if n_full >= 2:
+    ok("两个方向都关掉了「滑到底自动执行」（%d 处）" % n_full)
+else:
+    fail("❌ performsFirstActionWithFullSwipe 只出现在 %d 处 —— 必须两个方向都设成 NO，"
+         "否则滑到底会跳过确认直接删" % n_full)
+conf = find_method_body(ui_src2, "- (void)confirmDeleteBackup:")
+conf = strip_comments(conf) if conf else conf
+if conf is None:
+    fail("❌ 找不到 confirmDeleteBackup: 的实现体")
+else:
+    for needle, label in [("UIAlertControllerStyleAlert", "是弹窗而不是直接删"),
+                          ("UIAlertActionStyleDestructive", "「删除」是破坏性按钮"),
+                          ('@"取消"', "有取消按钮")]:
+        if needle in conf:
+            ok(label)
+        else:
+            fail("❌ confirmDeleteBackup: 缺少「%s」" % label)
+    if "totalSizeForBackupNamed" in conf and "locationsForBackupNamed" in conf:
+        ok("弹窗里摊开了「占多大 + 删哪些路径」")
+    else:
+        fail("❌ 确认弹窗没说清会删掉什么 —— 备份误删等于掐掉用户的退路，"
+             "必须把体积和具体路径列出来")
+
+head("E4：⭐ 删除必须放后台、且列表要按名字重取")
+rd = find_method_body(ui_src2, "- (void)runDeleteBackup:")
+rd = strip_comments(rd) if rd else rd
+if rd is None:
+    fail("❌ 找不到 runDeleteBackup: 的实现体")
+else:
+    if rd.find("dispatch_get_global_queue") >= 0 and rd.find("deleteBackupNamed:") >= 0:
+        if rd.find("dispatch_get_global_queue") < rd.find("deleteBackupNamed:"):
+            ok("删除在后台队列里做（iCloud 目录可能很大，主线程会卡死界面）")
+        else:
+            fail("❌ deleteBackupNamed: 没有排在 dispatch_get_global_queue 之后")
+    else:
+        fail("❌ 删除不是在后台队列里做的")
+    if "reloadBackups" in rd:
+        ok("删完重新拉取列表")
+    else:
+        fail("❌ 删完没有 reloadBackups —— 界面会留着已经不存在的行")
+    if "indexPath" in rd:
+        fail("❌ runDeleteBackup: 里出现了 indexPath —— 删完一项之后所有行下标都变了，"
+             "必须按**备份名**操作，不能按老下标（会删错人）")
+    else:
+        ok("按备份名操作，没有用 indexPath（不会删错行）")
+if "completionHandler(YES)" in ui_src2:
+    ok("先收起滑动再弹确认（滑动动画未结束时 present alert 会被 UIKit 吞掉）")
+else:
+    fail("❌ 滑动手势的 completionHandler 没先调 —— 表现为「点了删除没反应」")
+
 # ===========================================================================
 print()
 if FAIL:
